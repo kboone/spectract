@@ -3,6 +3,7 @@ import numpy as np
 import tqdm
 import sep
 from astropy.table import Table
+from functools import partial
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.special import erf
@@ -26,20 +27,8 @@ def nmad(x, *args, **kwargs):
     )
 
 
-def ensure_updated(func):
-    """Decorator to ensure that the SpaxelModel interpolators are updated."""
-    def decorated_func(self, *args, **kwargs):
-        if self._updated is False:
-            self.generate_interpolators()
-            self._updated = True
-
-        return func(self, *args, **kwargs)
-
-    return decorated_func
-
-
-def apply_order_2_transformation(c, x, y, z, return_components=False):
-    """Apply a transformation with terms up to 2nd order in 3 parameters.
+def _calculate_order_2_transformation(c, x, y, z, return_components=False):
+    """Calculate a transformation with terms up to 2nd order in 3 parameters.
 
     c is a list of 10 components describing the transformation
 
@@ -67,129 +56,222 @@ def apply_order_2_transformation(c, x, y, z, return_components=False):
         return res
 
 
-def fit_transformation(target_x, target_y, orig_x, orig_y, ref_x, ref_y,
-                       ref_z):
-    """Fit for a transformation between two coordinate sets.
+class OpticalModelTransformation():
+    def __init__(self):
+        self._parameters = None
+        self._scales = None
 
-    orig_x and orig_y will be transformed to match target_x and target_y. The
-    transformation will be done with terms up to second order in each of ref_x,
-    ref_y and ref_z.
+    def _calculate_transformation(self, params, ref_x, ref_y, ref_z,
+                                  return_components=False):
+        params_x = params[:len(params) // 2]
+        params_y = params[len(params) // 2:]
 
-    For my purposes, ref_x, ref_y and ref_z are intended to be the i and j
-    positions of spaxels and the target wavelength. orig/target x and y are
-    intended to be CCD coordinates.
-    """
-    mask = np.ones(len(target_x), dtype=bool)
-
-    max_iterations = 5
-    clip_sigma = 5.
-
-    for iteration in range(max_iterations):
-        def transform_coordinates(params):
-            params_x = params[:len(params) // 2]
-            params_y = params[len(params) // 2:]
-
-            offset_x, components_x = apply_order_2_transformation(
-                params_x, ref_x, ref_y, ref_z, return_components=True
-            )
-            offset_y, components_y = apply_order_2_transformation(
-                params_y, ref_x, ref_y, ref_z, return_components=True
-            )
-
-            return (orig_x + offset_x, orig_y + offset_y, components_x,
-                    components_y)
-
-        def to_min(params):
-            trans_x, trans_y, components_x, components_y = \
-                transform_coordinates(params)
-
-            # Calculate minimum
-            diff = (trans_x - target_x)**2 + (trans_y - target_y)**2
-            min_func = np.sum(diff[mask]) / np.sum(mask)
-
-            # Calculate gradient
-            # all_deriv_x = 2 * components_x * (trans_x - target_x)
-            # all_deriv_y = 2 * components_y * (trans_y - target_y)
-            # grad_x = np.sum(all_deriv_x[:, mask], axis=1)
-            # grad_y = np.sum(all_deriv_y[:, mask], axis=1)
-            # grad = np.hstack([grad_x, grad_y]) / np.sum(mask)
-
-            # print(min_func, params, grad)
-
-            # return min_func, grad
-
-            return min_func
-
-        def to_min_jac(params):
-            trans_x, trans_y, components_x, components_y = \
-                transform_coordinates(params)
-
-            # Calculate gradient
-            norm = 2. / np.sum(mask)
-            all_deriv_x = norm * components_x * (trans_x - target_x)
-            all_deriv_y = norm * components_y * (trans_y - target_y)
-            grad_x = np.sum(all_deriv_x[:, mask], axis=1)
-            grad_y = np.sum(all_deriv_y[:, mask], axis=1)
-            grad = np.hstack([grad_x, grad_y])
-
-            return grad
-
-        def to_min_hess(params):
-            trans_x, trans_y, components_x, components_y = \
-                transform_coordinates(params)
-
-            norm = 2. / np.sum(mask)
-            hess_x = norm * components_x[:, mask].dot(components_x[:, mask].T)
-            hess_y = norm * components_y[:, mask].dot(components_y[:, mask].T)
-            hess = block_diag(hess_x, hess_y)
-
-            return hess
-
-        res = minimize(
-            to_min,
-            np.zeros(20),
-            jac=to_min_jac,
-            method='BFGS',
+        offset_x, components_x = _calculate_order_2_transformation(
+            params_x, ref_x, ref_y, ref_z, return_components=True
+        )
+        offset_y, components_y = _calculate_order_2_transformation(
+            params_y, ref_x, ref_y, ref_z, return_components=True
         )
 
-        if not res.success:
-            print("WARNING: Transformation fit failed: \n\t%s" % res.message)
+        if return_components:
+            return (offset_x, offset_y, components_x, components_y)
+        else:
+            return (offset_x, offset_y)
 
-        trans_x, trans_y, components_x, components_y = \
-            transform_coordinates(res.x)
-        diff_x = trans_x - target_x
-        diff_y = trans_y - target_y
-
-        median_x_diff = np.median(diff_x)
-        nmad_x_diff = nmad(diff_x)
-        median_y_diff = np.median(diff_y)
-        nmad_y_diff = nmad(diff_y)
-
-        clip = (
-           ((diff_x - median_x_diff) < nmad_x_diff * clip_sigma) &
-           ((diff_y - median_y_diff) < nmad_y_diff * clip_sigma)
+    def _calculate_target(self, params):
+        offset_x, offset_y = self._calculate_transformation(
+            params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z
         )
 
-        new_mask = mask & clip
+        # Calculate target function
+        diff = ((self._fit_delta_x + offset_x)**2 +
+                (self._fit_delta_y + offset_y)**2)
+        target = np.sum(diff[self._fit_mask]) / np.sum(self._fit_mask)
 
-        if not res.success:
-            from IPython import embed; embed()
+        return target
 
-        if np.all(mask == new_mask):
-            print("No clipping required, done at iteration %d." %
-                  (iteration+1))
-            break
+    def _calculate_gradient(self, params):
+        offset_x, offset_y, components_x, components_y = \
+            self._calculate_transformation(
+                params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z, True
+            )
 
-        new_clip_count = np.sum(mask != new_mask)
+        # Calculate gradient
+        norm = 2. / np.sum(self._fit_mask)
+        all_deriv_x = norm * components_x * (self._fit_delta_x + offset_x)
+        all_deriv_y = norm * components_y * (self._fit_delta_y + offset_y)
+        grad_x = np.sum(all_deriv_x[:, self._fit_mask], axis=1)
+        grad_y = np.sum(all_deriv_y[:, self._fit_mask], axis=1)
+        grad = np.hstack([grad_x, grad_y])
 
-        print("Clipped %d objects in iteration %d" % (new_clip_count,
-                                                      iteration+1))
+        return grad
 
-        mask = new_mask
+    def _calculate_hessian(self, params):
+        offset_x, offset_y, components_x, components_y = \
+            self._calculate_transformation(
+                params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z, True
+            )
 
-    trans_x, trans_y, components_x, components_y = transform_coordinates(res.x)
+        # Calculate Hessian
+        mask = self._fit_mask
+        norm = 2. / np.sum(mask)
+        hess_x = norm * components_x[:, mask].dot(components_x[:, mask].T)
+        hess_y = norm * components_y[:, mask].dot(components_y[:, mask].T)
+        hess = block_diag(hess_x, hess_y)
 
-    return (trans_x, trans_y)
+        return hess
+
+    def _calculate_scale(self, data):
+        center = np.median(data)
+        scale = nmad(data)
+
+        scaled_data = (data - center) / scale
+
+        return scaled_data, center, scale
+
+    def _apply_scale(self, data, center, scale):
+        scaled_data = (data - center) / scale
+
+        return scaled_data
+
+    def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y, ref_z):
+        """Fit for a transformation between two coordinate sets.
+
+        orig_x and orig_y will be transformed to match target_x and target_y.
+        The transformation will be done with terms up to second order in each
+        of ref_x, ref_y and ref_z.
+
+        For my purposes, ref_x, ref_y and ref_z are intended to be the i and j
+        positions of spaxels and the target wavelength. orig/target x and y are
+        intended to be CCD coordinates.
+        """
+        max_iterations = 10
+        clip_sigma = 5.
+
+        scaled_ref_x, *scales_x = self._calculate_scale(ref_x)
+        scaled_ref_y, *scales_y = self._calculate_scale(ref_y)
+        scaled_ref_z, *scales_z = self._calculate_scale(ref_z)
+
+        self._scales = [scales_x, scales_y, scales_z]
+
+        self._fit_target_x = target_x
+        self._fit_target_y = target_y
+        self._fit_orig_x = orig_x
+        self._fit_orig_y = orig_y
+        self._fit_ref_x = scaled_ref_x
+        self._fit_ref_y = scaled_ref_y
+        self._fit_ref_z = scaled_ref_z
+
+        self._fit_delta_x = self._fit_orig_x - self._fit_target_x
+        self._fit_delta_y = self._fit_orig_y - self._fit_target_y
+
+        self._fit_mask = np.ones(len(target_x), dtype=bool)
+
+        fit_succeeded = False
+
+        for iteration in range(max_iterations):
+            res = minimize(
+                self._calculate_target,
+                np.zeros(20),
+                jac=self._calculate_gradient,
+                method='BFGS',
+            )
+
+            if not res.success:
+                error = ("ERROR: Transformation fit failed: \n\t%s" %
+                         res.message)
+                raise OpticalModelFitException(error)
+
+            offset_x, offset_y = self._calculate_transformation(
+                res.x, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z
+            )
+            diff_x = self._fit_delta_x + offset_x
+            diff_y = self._fit_delta_y + offset_y
+
+            median_x_diff = np.median(diff_x)
+            nmad_x_diff = nmad(diff_x)
+            median_y_diff = np.median(diff_y)
+            nmad_y_diff = nmad(diff_y)
+
+            # Don't break when comparing an image to itself.
+            min_nmad = 1e-8
+            if nmad_x_diff < min_nmad:
+                nmad_x_diff = min_nmad
+            if nmad_y_diff < min_nmad:
+                nmad_y_diff = min_nmad
+
+            clip = (
+               ((diff_x - median_x_diff) < nmad_x_diff * clip_sigma) &
+               ((diff_y - median_y_diff) < nmad_y_diff * clip_sigma)
+            )
+
+            new_mask = self._fit_mask & clip
+
+            if np.all(self._fit_mask == new_mask):
+                print("No clipping required, done at iteration %d." %
+                      (iteration+1))
+                fit_succeeded = True
+                break
+
+            new_clip_count = np.sum(self._fit_mask != new_mask)
+
+            print("Clipped %d objects in iteration %d" % (new_clip_count,
+                                                          iteration+1))
+
+            self._fit_mask = new_mask
+
+        if not fit_succeeded:
+            error = ("ERROR: Transformation fit did not converge after %d"
+                     " iterations!" % max_iterations)
+            raise OpticalModelFitException(error)
+
+        self._parameters = res.x
+        offset_x, offset_y = self._calculate_transformation(
+            self._parameters, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z
+        )
+
+        trans_x = self._fit_orig_x + offset_x
+        trans_y = self._fit_orig_y + offset_y
+
+        return (trans_x, trans_y)
+
+    def transform(self, orig_x, orig_y, ref_x, ref_y, ref_z):
+        """Apply the transformation to a set of x and y coordinates."""
+
+        if self._scales is None or self._parameters is None:
+            raise OpticalModelException(
+                'Transformation not initialized!'
+            )
+
+        # First, rescale our references.
+        scales_x, scales_y, scales_z = self._scales
+        scaled_ref_x = self._apply_scale(ref_x, *scales_x)
+        scaled_ref_y = self._apply_scale(ref_y, *scales_y)
+        scaled_ref_z = self._apply_scale(ref_z, *scales_z)
+
+        offset_x, offset_y = self._calculate_transformation(
+            self._parameters, scaled_ref_x, scaled_ref_y, scaled_ref_z
+        )
+
+        trans_x = orig_x + offset_x
+        trans_y = orig_y + offset_y
+
+        return (trans_x, trans_y)
+
+
+def ensure_updated(func):
+    """Decorator to ensure that the SpaxelModel interpolators are updated."""
+    def decorated_func(self, *args, **kwargs):
+        if self._updated is False:
+            self.generate_interpolators()
+            self._updated = True
+
+        return func(self, *args, **kwargs)
+
+    return decorated_func
+
+
+
 
 
 class SpaxelModel():

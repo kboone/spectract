@@ -3,7 +3,7 @@ from astropy.io import fits
 from matplotlib import pyplot as plt
 from astropy.table import join
 
-from optical_model import OpticalModel, fit_transformation
+from optical_model import OpticalModel, OpticalModelTransformation
 
 from idrtools import math
 
@@ -110,14 +110,12 @@ for cont_filename, arc_filename in filenames:
 
 for i, a in enumerate(arc_datas):
     for j, b in enumerate(arc_datas):
-        if i == j:
-            continue
-
         c = join(a, b, ['spaxel_i', 'spaxel_j', 'wave'])
 
-        trans_x, trans_y = fit_transformation(
+        trans = OpticalModelTransformation()
+        trans_x, trans_y = trans.fit(
             c['arc_x_1'], c['arc_y_1'], c['arc_x_2'], c['arc_y_2'],
-            c['spaxel_i'] / 7., c['spaxel_j'] / 7., (c['wave'] - 4250.) / 1000.
+            c['spaxel_i'], c['spaxel_j'], c['wave']
         )
 
         print(i, j, math.nmad(c['arc_x_1'] - trans_x),
