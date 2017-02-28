@@ -134,6 +134,22 @@ class OpticalModelTransformation():
 
         return scaled_data
 
+    def _calculate_clip(self, data, clip_sigma, min_nmad=1e-8):
+        """Return a mask which clips the data at a given scatter.
+
+        We allow for a minimum value on the nmad. This ensures that nothing
+        breaks when we compare data to itself.
+        """
+        data_median = np.median(data)
+        data_nmad = nmad(data)
+
+        if data_nmad < min_nmad:
+            data_nmad = min_nmad
+
+        clip = np.abs(data - data_median) < data_nmad * clip_sigma
+
+        return clip
+
     def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y, ref_z):
         """Fit for a transformation between two coordinate sets.
 
@@ -146,6 +162,7 @@ class OpticalModelTransformation():
         intended to be CCD coordinates.
         """
         max_iterations = 10
+        initial_clip_sigma = 10.
         clip_sigma = 5.
 
         scaled_ref_x, *scales_x = self._calculate_scale(ref_x)
@@ -165,7 +182,13 @@ class OpticalModelTransformation():
         self._fit_delta_x = self._fit_orig_x - self._fit_target_x
         self._fit_delta_y = self._fit_orig_y - self._fit_target_y
 
-        self._fit_mask = np.ones(len(target_x), dtype=bool)
+        # Initial clip
+        clip = (
+            self._calculate_clip(self._fit_delta_x, initial_clip_sigma) &
+            self._calculate_clip(self._fit_delta_y, initial_clip_sigma)
+        )
+        self._fit_mask = clip
+        print("Clipped %d objects in initial clip" % np.sum(~clip))
 
         fit_succeeded = False
 
@@ -188,21 +211,9 @@ class OpticalModelTransformation():
             diff_x = self._fit_delta_x + offset_x
             diff_y = self._fit_delta_y + offset_y
 
-            median_x_diff = np.median(diff_x)
-            nmad_x_diff = nmad(diff_x)
-            median_y_diff = np.median(diff_y)
-            nmad_y_diff = nmad(diff_y)
-
-            # Don't break when comparing an image to itself.
-            min_nmad = 1e-8
-            if nmad_x_diff < min_nmad:
-                nmad_x_diff = min_nmad
-            if nmad_y_diff < min_nmad:
-                nmad_y_diff = min_nmad
-
             clip = (
-               ((diff_x - median_x_diff) < nmad_x_diff * clip_sigma) &
-               ((diff_y - median_y_diff) < nmad_y_diff * clip_sigma)
+                self._calculate_clip(diff_x, clip_sigma) &
+                self._calculate_clip(diff_y, clip_sigma)
             )
 
             new_mask = self._fit_mask & clip

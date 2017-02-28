@@ -120,3 +120,5 @@ for i, a in enumerate(arc_datas):
 
         print(i, j, math.nmad(c['arc_x_1'] - trans_x),
               math.nmad(c['arc_y_1'] - trans_y))
+
+
