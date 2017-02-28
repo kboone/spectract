@@ -3,7 +3,6 @@ import numpy as np
 import tqdm
 import sep
 from astropy.table import Table
-from functools import partial
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.special import erf
@@ -27,7 +26,7 @@ def nmad(x, *args, **kwargs):
     )
 
 
-def _calculate_order_2_transformation(c, x, y, z, return_components=False):
+def _calculate_transformation_components(x, y, z, order):
     """Calculate a transformation with terms up to 2nd order in 3 parameters.
 
     c is a list of 10 components describing the transformation
@@ -35,25 +34,26 @@ def _calculate_order_2_transformation(c, x, y, z, return_components=False):
     If return_coefficients is True then the components that the c array
     multiplies is also returned (useful for calculating gradients).
     """
-    components = np.vstack([
-        np.ones(len(x)),
-        x,
-        y,
-        z,
-        x * x,
-        y * y,
-        z * z,
-        x * y,
-        y * z,
-        z * x,
-    ])
+    components = [np.ones(len(x))]
 
-    res = c.dot(components)
+    for iter_order in range(1, order+1):
+        for start_y in range(iter_order+1):
+            for start_z in range(start_y, iter_order+1):
+                new_component = np.ones(len(x))
 
-    if return_components:
-        return (res, components)
-    else:
-        return res
+                for i in range(iter_order):
+                    if i < start_y:
+                        new_component *= x
+                    elif i < start_z:
+                        new_component *= y
+                    else:
+                        new_component *= z
+
+                components.append(new_component)
+
+    components = np.vstack(components)
+
+    return components
 
 
 class OpticalModelTransformation():
@@ -66,12 +66,15 @@ class OpticalModelTransformation():
         params_x = params[:len(params) // 2]
         params_y = params[len(params) // 2:]
 
-        offset_x, components_x = _calculate_order_2_transformation(
-            params_x, ref_x, ref_y, ref_z, return_components=True
+        components_x = _calculate_transformation_components(
+            ref_x, ref_y, ref_z, self._transformation_order
         )
-        offset_y, components_y = _calculate_order_2_transformation(
-            params_y, ref_x, ref_y, ref_z, return_components=True
+        components_y = _calculate_transformation_components(
+            ref_x, ref_y, ref_z, self._transformation_order
         )
+
+        offset_x = params_x.dot(components_x)
+        offset_y = params_y.dot(components_y)
 
         if return_components:
             return (offset_x, offset_y, components_x, components_y)
@@ -150,7 +153,17 @@ class OpticalModelTransformation():
 
         return clip
 
-    def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y, ref_z):
+    def _calculate_num_parameters(self, order):
+        """Calculate the number of parameters for a given order of
+        transformation.
+        """
+        individual_parameters = int((order+1) * (order+2) * (order+3) / 6)
+        total_parameters = individual_parameters * 2
+
+        return total_parameters
+
+    def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y, ref_z,
+            order):
         """Fit for a transformation between two coordinate sets.
 
         orig_x and orig_y will be transformed to match target_x and target_y.
@@ -164,6 +177,9 @@ class OpticalModelTransformation():
         max_iterations = 10
         initial_clip_sigma = 10.
         clip_sigma = 5.
+
+        self._num_parameters = self._calculate_num_parameters(order)
+        self._transformation_order = order
 
         scaled_ref_x, *scales_x = self._calculate_scale(ref_x)
         scaled_ref_y, *scales_y = self._calculate_scale(ref_y)
@@ -195,7 +211,7 @@ class OpticalModelTransformation():
         for iteration in range(max_iterations):
             res = minimize(
                 self._calculate_target,
-                np.zeros(20),
+                np.zeros(self._num_parameters),
                 jac=self._calculate_gradient,
                 method='BFGS',
             )
@@ -280,9 +296,6 @@ def ensure_updated(func):
         return func(self, *args, **kwargs)
 
     return decorated_func
-
-
-
 
 
 class SpaxelModel():
@@ -445,8 +458,9 @@ class OpticalModel():
         - arc_y
         - model_x
         - model_y
-        - model_i
-        - model_j
+        - spaxel_i
+        - spaxel_j
+        - spaxel_number
 
         Note that there may be some misassociations.
         """
@@ -477,8 +491,10 @@ class OpticalModel():
         model_lambda = np.tile(arc_wave, num_spaxels)
 
         spaxel_i_single, spaxel_j_single = self.get_ij_coordinates()
+        spaxel_numbers_single = sorted(self._spaxels.keys())
         spaxel_i = np.repeat(spaxel_i_single, len(arc_wave))
         spaxel_j = np.repeat(spaxel_j_single, len(arc_wave))
+        spaxel_numbers = np.repeat(spaxel_numbers_single, len(arc_wave))
 
         # Initial catalog match. I scale the y direction slightly when doing
         # matches because the true arc spacing is much larger in that
@@ -500,6 +516,7 @@ class OpticalModel():
             'model_y': model_y,
             'spaxel_i': spaxel_i,
             'spaxel_j': spaxel_j,
+            'spaxel_number': spaxel_numbers,
         })
 
         return result
@@ -508,6 +525,10 @@ class OpticalModel():
         """Align the optical model to an arc"""
 
         data = self.identify_arc_lines(arc_data, arc_wave)
+
+        # TODO: This function hasn't been updated for the new fitting method.
+        # Redo it somehow.
+        raise OpticalModelException('align_to_arc outdated! Fix it!')
 
         trans_x, trans_y = fit_transformation(
             data['arc_x'], data['arc_y'], data['model_x'], data['model_y'],

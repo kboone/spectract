@@ -2,10 +2,9 @@ import numpy as np
 from astropy.io import fits
 from matplotlib import pyplot as plt
 from astropy.table import join
+from collections import defaultdict
 
 from optical_model import OpticalModel, OpticalModelTransformation
-
-from idrtools import math
 
 plt.ion()
 
@@ -81,10 +80,12 @@ arc_lines = [
 ]
 
 filenames = [
+    # Ref
+    ('./data/P08_231_109_010_07_B.fits', './data/P08_231_109_011_03_B.fits'),
+
     ('./data/P05_139_046_010_07_B.fits', './data/P05_139_046_011_03_B.fits'),
     ('./data/P06_151_149_010_07_B.fits', './data/P06_151_149_011_03_B.fits'),
     ('./data/P07_110_148_002_07_B.fits', './data/P07_110_148_003_03_B.fits'),
-    ('./data/P08_231_109_010_07_B.fits', './data/P08_231_109_011_03_B.fits'),
     ('./data/P09_184_174_010_07_B.fits', './data/P09_184_172_011_03_B.fits'),
     ('./data/P10_172_091_010_07_B.fits', './data/P10_172_091_011_03_B.fits'),
     ('./data/P11_267_082_002_07_B.fits', './data/P11_267_082_003_03_B.fits'),
@@ -94,6 +95,8 @@ filenames = [
     # Bad fits file??
     # ('./data/P15_089_087_010_07_B.fits', './data/P15_089_087_011_03_B.fits'),
 ]
+
+ref_idx = 0
 
 arc_images = []
 arc_datas = []
@@ -108,17 +111,69 @@ for cont_filename, arc_filename in filenames:
     arc_datas.append(arc_data)
 
 
-for i, a in enumerate(arc_datas):
-    for j, b in enumerate(arc_datas):
-        c = join(a, b, ['spaxel_i', 'spaxel_j', 'wave'])
+transformations = []
+ref_arc_data = arc_datas[ref_idx]
 
-        trans = OpticalModelTransformation()
-        trans_x, trans_y = trans.fit(
-            c['arc_x_1'], c['arc_y_1'], c['arc_x_2'], c['arc_y_2'],
-            c['spaxel_i'], c['spaxel_j'], c['wave']
-        )
+spaxel_xs = defaultdict(list)
+spaxel_ys = defaultdict(list)
+spaxel_waves = defaultdict(list)
 
-        print(i, j, math.nmad(c['arc_x_1'] - trans_x),
-              math.nmad(c['arc_y_1'] - trans_y))
+ref_arc_data['trans_x'] = ref_arc_data['arc_x']
+ref_arc_data['trans_y'] = ref_arc_data['arc_y']
 
+for i, other_arc_data in enumerate(arc_datas):
+    if i == ref_idx:
+        continue
 
+    join_arc_data = join(ref_arc_data, other_arc_data, ['spaxel_i', 'spaxel_j',
+                                                        'wave'])
+
+    trans = OpticalModelTransformation()
+    trans_x, trans_y = trans.fit(
+        join_arc_data['arc_x_1'],
+        join_arc_data['arc_y_1'],
+        join_arc_data['arc_x_2'],
+        join_arc_data['arc_y_2'],
+        join_arc_data['spaxel_i'],
+        join_arc_data['spaxel_j'],
+        join_arc_data['wave'],
+        2
+    )
+
+    # print(i, j,
+          # math.nmad(c['arc_x_1'] - c['arc_x_2']),
+          # math.nmad(c['arc_y_1'] - c['arc_y_2']),
+          # math.nmad(c['arc_x_1'] - trans_x),
+          # math.nmad(c['arc_y_1'] - trans_y))
+
+    transformations.append(trans)
+
+    # Transform lines that didn't find a match
+    full_trans_x, full_trans_y = trans.transform(
+        other_arc_data['arc_x'],
+        other_arc_data['arc_y'],
+        other_arc_data['spaxel_i'],
+        other_arc_data['spaxel_j'],
+        other_arc_data['wave']
+    )
+
+    for iter_trans_x, iter_trans_y, iter_arc_data in \
+            zip(full_trans_x, full_trans_y, other_arc_data):
+        spaxel_number = iter_arc_data['spaxel_number']
+        spaxel_xs[spaxel_number].append(iter_trans_x)
+        spaxel_ys[spaxel_number].append(iter_trans_y)
+        spaxel_waves[spaxel_number].append(iter_arc_data['wave'])
+
+    other_arc_data['trans_x'] = full_trans_x
+    other_arc_data['trans_y'] = full_trans_y
+
+# Triple transform test
+# trans_x_1, trans_y_1 = transformations[0][7].transform(
+    # c['arc_x_2'], c['arc_y_2'], c['spaxel_i'], c['spaxel_j'], c['wave']
+# )
+# trans_x_2, trans_y_2 = transformations[4][0].transform(
+    # trans_x_1, trans_y_1, c['spaxel_i'], c['spaxel_j'], c['wave']
+# )
+# trans_x_3, trans_y_3 = transformations[7][4].transform(
+    # trans_x_2, trans_y_2, c['spaxel_i'], c['spaxel_j'], c['wave']
+# )
