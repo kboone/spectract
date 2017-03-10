@@ -265,8 +265,6 @@ arc_profiles = np.vstack(arc_profiles)
 arc_dx = np.vstack(arc_dx)
 
 
-cause.exception
-
 # plt.imshow(cont_images[0], vmin=-10, vmax=5000)
 
 idx = 3
@@ -277,7 +275,6 @@ transformation = transformations[idx]
 residual_im = test_im.copy()
 
 for spaxel_number in initial_spaxel_l2xs.keys():
-    break
     # Fit to the continuum
 
     use_wave = np.arange(3500, 5200)
@@ -287,8 +284,6 @@ for spaxel_number in initial_spaxel_l2xs.keys():
 
     print(spaxel_number, x[500])
     # plt.scatter(x[500], y[500])
-
-    break
 
     bla = stack_data[stack_data['spaxel_number'] == spaxel_number]
 
@@ -325,13 +320,21 @@ for spaxel_number in initial_spaxel_l2xs.keys():
     all_wave = []
     all_y = np.arange(min_y, max_y)
     all_c = []
+
+    all_res_x = []
+    all_res_y = []
+    all_res_c = []
+
+
+    allxrange = np.arange(residual_im.shape[1])
+
     for iter_y in all_y:
         if iter_y % 100 == 0:
             print(iter_y, y2wave(iter_y))
         # print(iter_y, y2wave(iter_y))
         fit_x_start = y2x(iter_y)
         try:
-            res = fit_convgauss(test_im, iter_y, fit_x_start, 5, 2, 1.5)
+            res = fit_convgauss(test_im, iter_y, fit_x_start, 5, 2, 1.5, True)
 
             all_dx.append(res['mu'] - fit_x_start)
             all_dx_model.append(
@@ -342,7 +345,12 @@ for spaxel_number in initial_spaxel_l2xs.keys():
             all_wave.append(y2wave(iter_y))
             all_x.append(res['mu'])
 
-            residual_im[res['model_y'], res['model_x']] -= res['model_no_mean']
+            residual_im[res['model_y'], res['model_x']] -= res['model']
+
+            all_res_x.extend(allxrange[res['model_x']] - res['mu'])
+            all_res_y.extend(residual_im[res['model_y'], res['model_x']])
+            all_res_c.extend(res['amp'] * np.ones(len(res['model_no_mean'])))
+
         except OpticalModelFitException:
             print("FAIL")
             all_dx.append(np.nan)

@@ -26,20 +26,26 @@ def nmad(x, *args, **kwargs):
     )
 
 
-def _calculate_transformation_components(x, y, z, order):
-    """Calculate a transformation with terms up to 2nd order in 3 parameters.
-
-    c is a list of 10 components describing the transformation
-
-    If return_coefficients is True then the components that the c array
-    multiplies is also returned (useful for calculating gradients).
+def _calculate_transformation_components_3(x, y, z, order):
+    """Calculate the components for a transformation of 3 parameters.
     """
-    components = [np.ones(len(x))]
+    component_length = -1
+    for parameter in [x, y, z]:
+        try:
+            component_length = len(parameter)
+        except TypeError:
+            pass
+    if component_length == -1:
+        raise OpticalModelException(
+            "At least one parameter must be multivalued!"
+        )
+
+    components = [np.ones(component_length)]
 
     for iter_order in range(1, order+1):
         for start_y in range(iter_order+1):
             for start_z in range(start_y, iter_order+1):
-                new_component = np.ones(len(x))
+                new_component = np.ones(component_length)
 
                 for i in range(iter_order):
                     if i < start_y:
@@ -56,6 +62,194 @@ def _calculate_transformation_components(x, y, z, order):
     return components
 
 
+def _calculate_transformation_components_1(x, order):
+    """Calculate the components for a transformation of 1 parameter.
+    """
+    iter_component = np.ones(len(x))
+    components = [iter_component]
+
+    for iter_order in range(order):
+        iter_component = iter_component * x
+        components.append(iter_component)
+
+    components = np.vstack(components)
+
+    return components
+
+
+class SpaxelModelFitter():
+    def __init__(self):
+        self._parameters = None
+        self._wave_scale = None
+
+    def _calculate_model(self, params, wave, return_components=False):
+        components = _calculate_transformation_components_1(
+            wave, self._fit_order
+        )
+
+        model = params.dot(components)
+
+        if return_components:
+            return (model, components)
+        else:
+            return model
+
+    def _calculate_target(self, params):
+        model = self._calculate_model(
+            params, self._fit_wave
+        )
+
+        # Calculate target function
+        diff = (self._fit_vals - model)**2
+        target = np.sum(diff[self._fit_mask]) / np.sum(self._fit_mask)
+
+        return target
+
+    def _calculate_gradient(self, params):
+        model, components = self._calculate_model(
+            params, self._fit_wave, True
+        )
+
+        # Calculate gradient
+        norm = - 2. / np.sum(self._fit_mask)
+        all_deriv = norm * components * (self._fit_vals - model)
+        grad = np.sum(all_deriv[:, self._fit_mask], axis=1)
+
+        return grad
+
+    def _calculate_hessian(self, params):
+        model, components = self._calculate_model(
+            params, self._fit_wave, True
+        )
+
+        # Calculate Hessian
+        mask = self._fit_mask
+        norm = 2. / np.sum(mask)
+        hess = norm * components[:, mask].dot(components[:, mask].T)
+
+        return hess
+
+    def _calculate_scale(self, data):
+        center = np.median(data)
+        scale = nmad(data)
+
+        scaled_data = (data - center) / scale
+
+        return scaled_data, center, scale
+
+    def _apply_scale(self, data, center, scale):
+        scaled_data = (data - center) / scale
+
+        return scaled_data
+
+    def _calculate_clip(self, data, clip_sigma, min_nmad=1e-8):
+        """Return a mask which clips the data at a given scatter.
+
+        We allow for a minimum value on the nmad. This ensures that nothing
+        breaks when we compare data to itself.
+        """
+        data_median = np.median(data)
+        data_nmad = nmad(data)
+
+        if data_nmad < min_nmad:
+            data_nmad = min_nmad
+
+        clip = np.abs(data - data_median) < data_nmad * clip_sigma
+
+        return clip
+
+    def _calculate_num_parameters(self, order):
+        """Calculate the number of parameters for a given order of
+        transformation.
+        """
+        num_parameters = int(order) + 1
+
+        return num_parameters
+
+    def fit(self, wave, values, order):
+        """Fit for a polynomial that maps wave to values with clipping."""
+        max_iterations = 10
+        initial_clip_sigma = 10.
+        clip_sigma = 5.
+
+        self._fit_order = order
+        self._num_parameters = self._calculate_num_parameters(order)
+        self._transformation_order = order
+
+        scaled_wave, *wave_scale = self._calculate_scale(wave)
+
+        self._wave_scale = wave_scale
+
+        self._fit_vals = values
+        self._fit_wave = scaled_wave
+
+        # Initial clip
+        clip = self._calculate_clip(self._fit_vals, initial_clip_sigma)
+        self._fit_mask = clip
+        print("Clipped %d objects in initial clip" % np.sum(~clip))
+
+        fit_succeeded = False
+
+        for iteration in range(max_iterations):
+            res = minimize(
+                self._calculate_target,
+                np.zeros(self._num_parameters),
+                jac=self._calculate_gradient,
+                method='BFGS',
+            )
+
+            if not res.success:
+                error = ("ERROR: Transformation fit failed: \n\t%s" %
+                         res.message)
+                raise OpticalModelFitException(error)
+
+            model = self._calculate_model(res.x, self._fit_wave)
+            diff = self._fit_vals - model
+
+            clip = self._calculate_clip(diff, clip_sigma)
+
+            new_mask = self._fit_mask & clip
+
+            if np.all(self._fit_mask == new_mask):
+                print("No clipping required, done at iteration %d." %
+                      (iteration+1))
+                fit_succeeded = True
+                break
+
+            new_clip_count = np.sum(self._fit_mask != new_mask)
+            print("Clipped %d objects in iteration %d" % (new_clip_count,
+                                                          iteration+1))
+
+            self._fit_mask = new_mask
+
+        if not fit_succeeded:
+            error = ("ERROR: Transformation fit did not converge after %d"
+                     " iterations!" % max_iterations)
+            raise OpticalModelFitException(error)
+
+        self._parameters = res.x
+        model = self._calculate_model(self._parameters, self._fit_wave)
+
+        return model
+
+    def __call__(self, wave):
+        """Return the model at a set of wavelengths."""
+
+        if self._wave_scale is None or self._parameters is None:
+            raise OpticalModelException(
+                'Transformation not initialized!'
+            )
+
+        # First, rescale our wave.
+        scaled_wave = self._apply_scale(wave, *self._wave_scale)
+
+        model = self._calculate_model(
+            self._parameters, scaled_wave
+        )
+
+        return model
+
+
 class OpticalModelTransformation():
     def __init__(self):
         self._parameters = None
@@ -66,10 +260,10 @@ class OpticalModelTransformation():
         params_x = params[:len(params) // 2]
         params_y = params[len(params) // 2:]
 
-        components_x = _calculate_transformation_components(
+        components_x = _calculate_transformation_components_3(
             ref_x, ref_y, ref_z, self._transformation_order
         )
-        components_y = _calculate_transformation_components(
+        components_y = _calculate_transformation_components_3(
             ref_x, ref_y, ref_z, self._transformation_order
         )
 
@@ -204,7 +398,7 @@ class OpticalModelTransformation():
             self._calculate_clip(self._fit_delta_y, initial_clip_sigma)
         )
         self._fit_mask = clip
-        print("Clipped %d objects in initial clip" % np.sum(~clip))
+        # print("Clipped %d objects in initial clip" % np.sum(~clip))
 
         fit_succeeded = False
 
@@ -235,15 +429,14 @@ class OpticalModelTransformation():
             new_mask = self._fit_mask & clip
 
             if np.all(self._fit_mask == new_mask):
-                print("No clipping required, done at iteration %d." %
-                      (iteration+1))
+                # print("No clipping required, done at iteration %d." %
+                # (iteration+1))
                 fit_succeeded = True
                 break
 
-            new_clip_count = np.sum(self._fit_mask != new_mask)
-
-            print("Clipped %d objects in iteration %d" % (new_clip_count,
-                                                          iteration+1))
+            # new_clip_count = np.sum(self._fit_mask != new_mask)
+            # print("Clipped %d objects in iteration %d" % (new_clip_count,
+            # iteration+1))
 
             self._fit_mask = new_mask
 
@@ -262,7 +455,7 @@ class OpticalModelTransformation():
 
         return (trans_x, trans_y)
 
-    def transform(self, orig_x, orig_y, ref_x, ref_y, ref_z):
+    def transform(self, orig_x, orig_y, ref_x, ref_y, ref_z, reverse=False):
         """Apply the transformation to a set of x and y coordinates."""
 
         if self._scales is None or self._parameters is None:
@@ -280,8 +473,13 @@ class OpticalModelTransformation():
             self._parameters, scaled_ref_x, scaled_ref_y, scaled_ref_z
         )
 
-        trans_x = orig_x + offset_x
-        trans_y = orig_y + offset_y
+        if reverse:
+            scale = -1.
+        else:
+            scale = 1.
+
+        trans_x = orig_x + scale * offset_x
+        trans_y = orig_y + scale * offset_y
 
         return (trans_x, trans_y)
 
@@ -530,6 +728,9 @@ class OpticalModel():
         # Redo it somehow.
         raise OpticalModelException('align_to_arc outdated! Fix it!')
 
+        def fit_transformation(x):
+            pass
+
         trans_x, trans_y = fit_transformation(
             data['arc_x'], data['arc_y'], data['model_x'], data['model_y'],
             data['spaxel_i'], data['spaxel_j'], data['wave']
@@ -539,12 +740,31 @@ class OpticalModel():
 
 
 def convgauss(x, amp, mu, sigma):
+    """Evaluate a 1d gaussian convolved with a pixel.
+
+    - x is a 1d array of the x positions.
+    - amp is the integral of the gaussian.
+    - mu is the center position.
+    - sigma is the standard deviation of the Gaussian.
+    """
     return (
         amp*0.5*(
             erf((x + 0.5 - mu) / (np.sqrt(2) * sigma)) -
             erf((x - 0.5 - mu) / (np.sqrt(2) * sigma))
         )
     )
+
+
+def multigauss(amp1, mu1, sigma1, amp2, mu2, sigma2):
+    """Determine parameters of one gaussian convolved with another.
+
+    Returns amp, mu and sigma for the convolution of the two input gaussians.
+    """
+    amp = amp1 * amp2
+    mu = mu1 + mu2
+    sigma = np.sqrt(sigma1**2 + sigma2**2)
+
+    return amp, mu, sigma
 
 
 def convgauss_2d(mesh_x, mesh_y, amp, mu_x, mu_y, sigma_x, sigma_y):
@@ -561,6 +781,94 @@ def convgauss_2d(mesh_x, mesh_y, amp, mu_x, mu_y, sigma_x, sigma_y):
         convgauss(mesh_x, amp, mu_x, sigma_x) *
         convgauss(mesh_y, amp, mu_y, sigma_y)
     )
+
+def lorentzcorr(x):
+    relamp = 0.06
+    gamma = 6.
+    return relamp / (np.pi * gamma * (1 + (x / gamma)**2))
+
+
+def fit_convgauss(data, y, start_mu, search_mu, start_sigma, search_sigma,
+                  lorentzian=False):
+    """Fit a 1D gaussian convolved with a pixel to data"""
+    fit_min_mu = int(np.around(start_mu - search_mu))
+    fit_max_mu = int(np.around(start_mu + search_mu))
+    fit_min_sigma = start_sigma - search_sigma
+    fit_max_sigma = start_sigma + search_sigma
+
+    model_x = slice(fit_min_mu, fit_max_mu+1)
+    model_y = y
+    fit_data = data[model_y, model_x].copy()
+
+    x_vals = np.arange(fit_min_mu, fit_max_mu+1)
+
+    def model(amp, mu, sigma, mean):
+        model = convgauss(x_vals, amp, mu, sigma) + mean
+
+        if lorentzian:
+            model += amp * lorentzcorr(x_vals - mu)
+
+        return model
+
+    def fit_func(x):
+        return np.sum((fit_data - model(*x))**2)
+
+    use_start_mu = fit_min_mu + np.argmax(fit_data)
+    start_amp = np.sum(fit_data)
+
+    start_params = np.array([start_amp, use_start_mu, start_sigma, 0.])
+    bounds = [
+        (0.1*start_amp, 10*start_amp),
+        (fit_min_mu, fit_max_mu),
+        (fit_min_sigma, fit_max_sigma),
+        (None, None),
+    ]
+
+    res = minimize(
+        fit_func,
+        start_params,
+        method='L-BFGS-B',
+        bounds=bounds
+    )
+
+    if not res.success:
+        raise OpticalModelFitException(res.message)
+
+    fit_params = res.x
+
+    fit_amp, fit_mu, fit_sigma, fit_mean = fit_params
+    result_model = model(*fit_params)
+
+    no_mean_fit_params = fit_params.copy()
+    no_mean_fit_params[-1] = 0.
+    result_model_no_mean = model(*no_mean_fit_params)
+
+    do_print = False
+
+    if fit_amp < 0.5*start_amp or fit_amp > 1.5*start_amp:
+        print("WARNING: Fit amplitude out of normal bounds:")
+        do_print = True
+
+    if do_print:
+        print("Fit results:")
+        print("    Amplitude: %8.2f (start: %8.2f)" % (fit_amp, start_amp))
+        print("    Center:    %8.2f (start: %8.2f)" % (fit_mu, use_start_mu))
+        print("    Sigma:     %8.2f (start: %8.2f)" % (fit_sigma, start_sigma))
+        print("    Mean:      %8.2f (start: %8.2f)" % (fit_mean, 0.))
+        print("    Residual power fraction: %8.2f" %
+              (np.sum((fit_data - result_model)**2) / np.sum(fit_data**2)))
+
+    return {
+        'amp': fit_amp,
+        'mu': fit_mu,
+        'sigma': fit_sigma,
+        'mean': fit_mean,
+        'model': result_model,
+        'model_no_mean': result_model_no_mean,
+        'model_x': model_x,
+        'model_y': model_y,
+        'fit_data': fit_data,
+    }
 
 
 def fit_convgauss_2d(data, start_x, start_y, search_x, search_y,
