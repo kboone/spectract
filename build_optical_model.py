@@ -210,3 +210,11 @@ for spaxel_number in optical_model.spaxel_numbers:
     }
 
 optical_model.update(new_spaxel_data)
+
+
+# Find sigma and x as a function of wavelength
+print("Using continuum images to refine model.")
+
+for i in cont_images:
+    dx, patch = i.get_sum_patch(12, [5000.])
+    plt.scatter(dx, patch / np.sum(patch))

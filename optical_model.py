@@ -345,6 +345,10 @@ class IfuCcdImage():
                                wavelength):
         """Transform model CCD coordinates to CCD coordinates."""
 
+        if self._transformation is None:
+            # No transformation defined
+            return model_x, model_y
+
         ccd_x, ccd_y = self._transformation.transform(
             model_x,
             model_y,
@@ -354,6 +358,48 @@ class IfuCcdImage():
         )
 
         return ccd_x, ccd_y
+
+    def get_patch(self, spaxel_number, wavelength, width_x=4, width_y=10):
+        """Return a patch of data around a given spaxel and wavelength.
+
+        Returns:
+            dx: the x distances from the target point
+            dy: the y distances from the target point
+            patch: the requested patch
+        """
+        center_x, center_y = \
+            self.get_ccd_coordinates(spaxel_number, wavelength)
+
+        int_center_y = int(np.around(center_y))
+        int_center_x = int(np.around(center_x))
+
+        x_vals = np.arange(int_center_x - width_x, int_center_x + width_x + 1)
+        y_vals = np.arange(int_center_y - width_y, int_center_y + width_y + 1)
+        dx_vals = x_vals - center_x
+        dy_vals = y_vals - center_y
+
+        data = self._fits_file[0].data
+
+        patch = data[
+            int_center_y - width_y:int_center_y + width_y + 1,
+            int_center_x - width_x:int_center_x + width_x + 1,
+        ]
+
+        return dx_vals, dy_vals, patch
+
+    def get_sum_patch(self, spaxel_number, wavelength, **kwargs):
+        """Return a summed patch of data around a given spaxel and wavelength.
+
+        Returns:
+            dx: the x distances from the target point
+            sum_patch: the patch at the target point summed in the y direction.
+        """
+        dx_vals, dy_vals, patch = \
+            self.get_patch(spaxel_number, wavelength, **kwargs)
+
+        sum_patch = np.sum(patch, axis=0)
+
+        return dx_vals, sum_patch
 
 
 class SpaxelModelFitter():
