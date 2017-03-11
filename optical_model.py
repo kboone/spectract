@@ -1,8 +1,8 @@
 from matplotlib import pyplot as plt
 import numpy as np
-import tqdm
 import sep
-from astropy.table import Table
+from astropy.table import Table, join
+from astropy.io import fits
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.special import erf
@@ -77,14 +77,244 @@ def _calculate_transformation_components_1(x, order):
     return components
 
 
+class IfuCcdImage():
+    def __init__(self, path, optical_model, transformation=None):
+        self._path = path
+        self._fits_file = fits.open(path)
+        self._optical_model = optical_model
+        self._transformation = transformation
+
+        self.__arc_data = None
+
+    def plot(self, **kwargs):
+        data = self._fits_file[0].data
+
+        if 'vmin' not in kwargs:
+            kwargs['vmin'] = np.percentile(data, 1.)
+        if 'vmax' not in kwargs:
+            kwargs['vmax'] = np.percentile(data, 99.)
+
+        plt.imshow(data, **kwargs)
+
+    def identify_arc_lines(self, arc_wavelength):
+        """Identify arc line locations in the image.
+
+        This function only needs a rough optical model to work. If called on an
+        image that isn't an arc image, this function will fail horribly. Don't
+        do that.
+
+        Returns an astropy Table with the following columns:
+        - wavelength
+        - ccd_x
+        - ccd_y
+        - model_x
+        - model_y
+        - spaxel_i
+        - spaxel_j
+        - spaxel_x
+        - spaxel_y
+        - spaxel_number
+
+        Note that there may be some misassociations.
+        """
+        data = self._fits_file[0].data
+
+        # First, find the arc line locations using sep.
+        # sep requires a specific byte order which fits files are rarely in.
+        # Swap the byte order if necessary.
+        if data.dtype == '>f4':
+            data = data.byteswap().newbyteorder()
+
+        # Background. We will pick up some of the slit light here, so we use a
+        # big box in order to mitigate the effect of that. So long as the
+        # background is smooth and gives an image with roughly zero mean we are
+        # OK here since the arcs are much brighter than the continuum. Do NOT
+        # use a background like this for analysis of slit data!
+        background = sep.Background(data, bw=256, bh=256)
+
+        sub_data = data - background.back()
+        objects = sep.extract(sub_data, 10.0, minarea=4)
+        ccd_x = objects['x']
+        ccd_y = objects['y']
+
+        # Determine the line locations in the optical model.
+        model_x_2d, model_y_2d = \
+            self._optical_model.get_all_ccd_coordinates(arc_wavelength)
+        num_spaxels = model_x_2d.shape[0]
+        model_x = model_x_2d.flatten()
+        model_y = model_y_2d.flatten()
+        model_lambda = np.tile(arc_wavelength, num_spaxels)
+
+        spaxel_x_single, spaxel_y_single = \
+            self._optical_model.get_all_spaxel_xy_coordinates()
+        spaxel_i_single, spaxel_j_single = \
+            self._optical_model.get_all_spaxel_ij_coordinates()
+
+        spaxel_numbers_single = sorted(self._optical_model._spaxels.keys())
+
+        spaxel_i = np.repeat(spaxel_i_single, len(arc_wavelength))
+        spaxel_j = np.repeat(spaxel_j_single, len(arc_wavelength))
+        spaxel_x = np.repeat(spaxel_x_single, len(arc_wavelength))
+        spaxel_y = np.repeat(spaxel_y_single, len(arc_wavelength))
+        spaxel_numbers = np.repeat(spaxel_numbers_single, len(arc_wavelength))
+
+        # Initial catalog match. I scale the y direction slightly when doing
+        # matches because the true arc spacing is much larger in that
+        # direction. This allows for larger offsets without failure.
+        y_scale = 3.
+        kdtree_arc = KDTree(np.vstack([ccd_x, ccd_y / y_scale]).T)
+        dist, matches = kdtree_arc.query(
+            np.vstack([model_x, model_y / y_scale]).T
+        )
+
+        match_ccd_x = ccd_x[matches]
+        match_ccd_y = ccd_y[matches]
+
+        result = Table({
+            'wavelength': model_lambda,
+            'ccd_x': match_ccd_x,
+            'ccd_y': match_ccd_y,
+            'model_x': model_x,
+            'model_y': model_y,
+            'spaxel_i': spaxel_i,
+            'spaxel_j': spaxel_j,
+            'spaxel_x': spaxel_x,
+            'spaxel_y': spaxel_y,
+            'spaxel_number': spaxel_numbers,
+        })
+
+        return result
+
+    def get_arc_data(self):
+        """Return arc data at a predefined set of wavelength.
+
+        This will only calculate the arc data the first time that it is called.
+        """
+        if self.__arc_data is None:
+            print("TODO: put the arc lines in a proper place!")
+            arc_wavelength = [
+                # 3252.52392578,
+                3261.05493164,          # GOOD
+                # 3341.4839,
+                # 3403.65209961,
+                3466.19995117,          # GOOD
+                # 3467.6550293,
+                3610.50805664,          # GOOD
+                # 3612.87304688,
+                # 3650.15795898,
+                # 3654.84008789,
+                4046.56494141,          # GOOD
+                4077.8369,              # GOOD
+                # 4158.58984375,     why is this bad? Looks great but comes out
+                # off by around 0.2 in Y!
+                # 4200.67382812,
+                # 4347.50585938,
+                4358.33496094,          # GOOD
+                # 4678.1489,
+                4799.91210938,          # GOOD
+                5085.82177734,          # GOOD
+                # 5460.75,
+            ]
+
+            self.__arc_data = self.identify_arc_lines(arc_wavelength)
+
+        return self.__arc_data
+
+    def align_to_arc_image(self, reference_image):
+        """Align one arc image to another one."""
+
+        ref_arc_data = reference_image.get_arc_data()
+        arc_data = self.get_arc_data()
+
+        join_arc_data = join(arc_data, ref_arc_data, ['spaxel_number',
+                                                      'wavelength'])
+
+        transformation = OpticalModelTransformation()
+
+        trans_x, trans_y = transformation.fit(
+            join_arc_data['ccd_x_1'],
+            join_arc_data['ccd_y_1'],
+            join_arc_data['ccd_x_2'],
+            join_arc_data['ccd_y_2'],
+            join_arc_data['spaxel_x_1'],
+            join_arc_data['spaxel_y_1'],
+            join_arc_data['wavelength'],
+            order=3
+        )
+
+        self._transformation = transformation
+
+    def get_ccd_coordinates(self, spaxel_number, wavelength,
+                            apply_transformation=True):
+        """Get the CCD coordinates for a given spaxel at a given wavelength.
+
+        If apply_transformation is True, the image transformation from the
+        model CCD coordinates to image CCD coordinates will be applied.
+        """
+
+        # Calculate the model x and y coordinates.
+        model_x, model_y = \
+            self._optical_model.get_ccd_coordinates(spaxel_number, wavelength)
+
+        if apply_transformation and self._transformation is not None:
+            spaxel_x, spaxel_y = \
+                self._optical_model.get_spaxel_xy_coordinates(spaxel_number)
+
+            ccd_x, ccd_y = self.transform_model_to_ccd(
+                model_x,
+                model_y,
+                spaxel_x,
+                spaxel_y,
+                wavelength,
+            )
+        else:
+            ccd_x = model_x
+            ccd_y = model_y
+
+        return ccd_x, ccd_y
+
+    def transform_ccd_to_model(self, ccd_x, ccd_y, spaxel_x, spaxel_y,
+                               wavelength):
+        """Transform CCD coordinates to model CCD coordinates."""
+
+        if self._transformation is None:
+            # No transformation defined
+            return ccd_x, ccd_y
+
+        model_x, model_y = self._transformation.transform(
+            ccd_x,
+            ccd_y,
+            spaxel_x,
+            spaxel_y,
+            wavelength,
+            reverse=True
+        )
+
+        return model_x, model_y
+
+    def transform_model_to_ccd(self, model_x, model_y, spaxel_x, spaxel_y,
+                               wavelength):
+        """Transform model CCD coordinates to CCD coordinates."""
+
+        ccd_x, ccd_y = self._transformation.transform(
+            model_x,
+            model_y,
+            spaxel_x,
+            spaxel_y,
+            wavelength
+        )
+
+        return ccd_x, ccd_y
+
+
 class SpaxelModelFitter():
     def __init__(self):
         self._parameters = None
-        self._wave_scale = None
+        self._wavelength_scale = None
 
-    def _calculate_model(self, params, wave, return_components=False):
+    def _calculate_model(self, params, wavelength, return_components=False):
         components = _calculate_transformation_components_1(
-            wave, self._fit_order
+            wavelength, self._fit_order
         )
 
         model = params.dot(components)
@@ -96,7 +326,7 @@ class SpaxelModelFitter():
 
     def _calculate_target(self, params):
         model = self._calculate_model(
-            params, self._fit_wave
+            params, self._fit_wavelength
         )
 
         # Calculate target function
@@ -107,7 +337,7 @@ class SpaxelModelFitter():
 
     def _calculate_gradient(self, params):
         model, components = self._calculate_model(
-            params, self._fit_wave, True
+            params, self._fit_wavelength, True
         )
 
         # Calculate gradient
@@ -119,7 +349,7 @@ class SpaxelModelFitter():
 
     def _calculate_hessian(self, params):
         model, components = self._calculate_model(
-            params, self._fit_wave, True
+            params, self._fit_wavelength, True
         )
 
         # Calculate Hessian
@@ -166,8 +396,10 @@ class SpaxelModelFitter():
 
         return num_parameters
 
-    def fit(self, wave, values, order):
-        """Fit for a polynomial that maps wave to values with clipping."""
+    def fit(self, wavelength, values, order):
+        """Fit for a polynomial that maps wavelength to values with
+        clipping.
+        """
         max_iterations = 10
         initial_clip_sigma = 10.
         clip_sigma = 5.
@@ -176,12 +408,13 @@ class SpaxelModelFitter():
         self._num_parameters = self._calculate_num_parameters(order)
         self._transformation_order = order
 
-        scaled_wave, *wave_scale = self._calculate_scale(wave)
+        scaled_wavelength, *wavelength_scale = \
+            self._calculate_scale(wavelength)
 
-        self._wave_scale = wave_scale
+        self._wavelength_scale = wavelength_scale
 
         self._fit_vals = values
-        self._fit_wave = scaled_wave
+        self._fit_wavelength = scaled_wavelength
 
         # Initial clip
         clip = self._calculate_clip(self._fit_vals, initial_clip_sigma)
@@ -203,7 +436,7 @@ class SpaxelModelFitter():
                          res.message)
                 raise OpticalModelFitException(error)
 
-            model = self._calculate_model(res.x, self._fit_wave)
+            model = self._calculate_model(res.x, self._fit_wavelength)
             diff = self._fit_vals - model
 
             clip = self._calculate_clip(diff, clip_sigma)
@@ -228,23 +461,25 @@ class SpaxelModelFitter():
             raise OpticalModelFitException(error)
 
         self._parameters = res.x
-        model = self._calculate_model(self._parameters, self._fit_wave)
+        model = self._calculate_model(self._parameters, self._fit_wavelength)
 
         return model
 
-    def __call__(self, wave):
+    def __call__(self, wavelength):
         """Return the model at a set of wavelengths."""
 
-        if self._wave_scale is None or self._parameters is None:
+        if self._wavelength_scale is None or self._parameters is None:
             raise OpticalModelException(
                 'Transformation not initialized!'
             )
 
-        # First, rescale our wave.
-        scaled_wave = self._apply_scale(wave, *self._wave_scale)
+        # First, rescale our wavelength.
+        scaled_wavelength = self._apply_scale(
+            wavelength, *self._wavelength_scale
+        )
 
         model = self._calculate_model(
-            self._parameters, scaled_wave
+            self._parameters, scaled_wavelength
         )
 
         return model
@@ -357,7 +592,7 @@ class OpticalModelTransformation():
         return total_parameters
 
     def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y, ref_z,
-            order):
+            order, verbose=False):
         """Fit for a transformation between two coordinate sets.
 
         orig_x and orig_y will be transformed to match target_x and target_y.
@@ -398,7 +633,8 @@ class OpticalModelTransformation():
             self._calculate_clip(self._fit_delta_y, initial_clip_sigma)
         )
         self._fit_mask = clip
-        # print("Clipped %d objects in initial clip" % np.sum(~clip))
+        if verbose:
+            print("Clipped %d objects in initial clip" % np.sum(~clip))
 
         fit_succeeded = False
 
@@ -429,14 +665,16 @@ class OpticalModelTransformation():
             new_mask = self._fit_mask & clip
 
             if np.all(self._fit_mask == new_mask):
-                # print("No clipping required, done at iteration %d." %
-                # (iteration+1))
+                if verbose:
+                    print("No clipping required, done at iteration %d." %
+                          (iteration+1))
                 fit_succeeded = True
                 break
 
-            # new_clip_count = np.sum(self._fit_mask != new_mask)
-            # print("Clipped %d objects in iteration %d" % (new_clip_count,
-            # iteration+1))
+            if verbose:
+                new_clip_count = np.sum(self._fit_mask != new_mask)
+                print("Clipped %d objects in iteration %d" % (new_clip_count,
+                                                              iteration+1))
 
             self._fit_mask = new_mask
 
@@ -497,18 +735,18 @@ def ensure_updated(func):
 
 
 class SpaxelModel():
-    def __init__(self, number, i_coord, j_coord, x_mla, y_mla, wave, x_ccd,
-                 y_ccd, sigma):
-        self._number = number
-        self._i_coord = i_coord
-        self._j_coord = j_coord
-        self._x_mla = x_mla
-        self._y_mla = y_mla
+    def __init__(self, spaxel_number, spaxel_i, spaxel_j, spaxel_x, spaxel_y,
+                 wavelength, ccd_x, ccd_y, width):
+        self._spaxel_number = spaxel_number
+        self._spaxel_i = spaxel_i
+        self._spaxel_j = spaxel_j
+        self._spaxel_x = spaxel_x
+        self._spaxel_y = spaxel_y
 
-        self._wave = wave
-        self._x_ccd = x_ccd
-        self._y_ccd = y_ccd
-        self._sigma = sigma
+        self._wavelength = wavelength
+        self._ccd_x = ccd_x
+        self._ccd_y = ccd_y
+        self._width = width
 
         # Keep track of whether the interpolators are updated or not so that we
         # don't regenerate them unless necessary.
@@ -516,26 +754,67 @@ class SpaxelModel():
         self._interp_wave_to_x = None
         self._interp_wave_to_y = None
         self._interp_y_to_wave = None
+        self._interp_y_to_x = None
+
+    def update(self, spaxel_number=None, spaxel_i=None, spaxel_j=None,
+               spaxel_x=None, spaxel_y=None, wavelength=None, ccd_x=None,
+               ccd_y=None, width=None):
+        """Update the model.
+
+        Any of the internal variables can be updated with this call. It is up
+        to the user to make sure that they are all the correct length and
+        format for now... Make sure that wavelength, ccd_x, ccd_y and width all
+        have the same shape or things will break!
+        """
+        if spaxel_number is not None:
+            self._spaxel_number = spaxel_number
+        if spaxel_i is not None:
+            self._spaxel_i = spaxel_i
+        if spaxel_j is not None:
+            self._spaxel_j = spaxel_j
+        if spaxel_x is not None:
+            self._spaxel_x = spaxel_x
+        if spaxel_y is not None:
+            self._spaxel_y = spaxel_y
+
+        if wavelength is not None:
+            self._wavelength = wavelength
+        if ccd_x is not None:
+            self._ccd_x = ccd_x
+        if ccd_y is not None:
+            self._ccd_y = ccd_y
+        if width is not None:
+            self._width = width
+
+        self._updated = False
 
     def generate_interpolators(self):
         self._interp_wave_to_x = \
-            InterpolatedUnivariateSpline(self._wave, self._x_ccd)
+            InterpolatedUnivariateSpline(self._wavelength, self._ccd_x)
         self._interp_wave_to_y = \
-            InterpolatedUnivariateSpline(self._wave, self._y_ccd)
+            InterpolatedUnivariateSpline(self._wavelength, self._ccd_y)
         self._interp_y_to_wave = \
-            InterpolatedUnivariateSpline(self._y_ccd, self._wave)
+            InterpolatedUnivariateSpline(self._ccd_y, self._wavelength)
+        self._interp_y_to_x = \
+            InterpolatedUnivariateSpline(self._ccd_y, self._ccd_x)
 
     @ensure_updated
-    def get_ccd_coordinates(self, wave):
-        return (self._interp_wave_to_x(wave), self._interp_wave_to_y(wave))
+    def get_ccd_coordinates(self, wavelength):
+        return (self._interp_wave_to_x(wavelength),
+                self._interp_wave_to_y(wavelength))
 
-    def get_ij_coordinates(self):
-        return (self._i_coord, self._j_coord)
+    @property
+    def ij_coordinates(self):
+        return (self._spaxel_i, self._spaxel_j)
+
+    @property
+    def xy_coordinates(self):
+        return (self._spaxel_x, self._spaxel_y)
 
     def apply_shift(self, shift_x, shift_y):
-        """Apply a shift in x and y to the model"""
-        self._x_ccd += shift_x
-        self._y_ccd += shift_y
+        """Apply a shift in the x and y CCD positions to the model"""
+        self._ccd_x += shift_x
+        self._ccd_y += shift_y
 
         self._updated = False
 
@@ -553,29 +832,61 @@ class OpticalModel():
             spaxel = SpaxelModel(**spaxel_data)
             self._spaxels[spaxel_number] = spaxel
 
-    def get_ij_coordinates(self):
-        """Return the i,j coordinates of every spaxel
+    @property
+    def spaxel_numbers(self):
+        """Return an array of all of the spaxel numbers.
 
-        The coordinates will be sorted by the spaxel number to ensure a
-        consistent order.
+        The array will be sorted.
         """
-        ordered_spaxel_numbers = sorted(self._spaxels.keys())
+        return sorted(self._spaxels.keys())
 
-        all_i = []
-        all_j = []
+    def get_all_spaxel_ij_coordinates(self):
+        """Return the spaxel i,j coordinates of every spaxel
 
-        for spaxel_number in ordered_spaxel_numbers:
+        The coordinates will be sorted by the spaxel number.
+        """
+        all_spaxel_i = []
+        all_spaxel_j = []
+
+        for spaxel_number in self.spaxel_numbers:
             spaxel = self._spaxels[spaxel_number]
-            i_coord, j_coord = spaxel.get_ij_coordinates()
-            all_i.append(i_coord)
-            all_j.append(j_coord)
+            spaxel_i, spaxel_j = spaxel.ij_coordinates
+            all_spaxel_i.append(spaxel_i)
+            all_spaxel_j.append(spaxel_j)
 
-        all_i = np.array(all_i)
-        all_j = np.array(all_j)
+        all_spaxel_i = np.array(all_spaxel_i)
+        all_spaxel_j = np.array(all_spaxel_j)
 
-        return all_i, all_j
+        return all_spaxel_i, all_spaxel_j
 
-    def get_ccd_coordinates(self, wavelength):
+    def get_spaxel_ij_coordinates(self, spaxel_number):
+        """Return the spaxel i,j coordinates of a given spaxel"""
+        return self._spaxels[spaxel_number].ij_coordinates
+
+    def get_all_spaxel_xy_coordinates(self):
+        """Return the spaxel x,y coordinates of every spaxel
+
+        The coordinates will be sorted by the spaxel number.
+        """
+        all_spaxel_x = []
+        all_spaxel_y = []
+
+        for spaxel_number in self.spaxel_numbers:
+            spaxel = self._spaxels[spaxel_number]
+            spaxel_x, spaxel_y = spaxel.xy_coordinates
+            all_spaxel_x.append(spaxel_x)
+            all_spaxel_y.append(spaxel_y)
+
+        all_spaxel_x = np.array(all_spaxel_x)
+        all_spaxel_y = np.array(all_spaxel_y)
+
+        return all_spaxel_x, all_spaxel_y
+
+    def get_spaxel_xy_coordinates(self, spaxel_number):
+        """Return the spaxel x,y coordinates of a given spaxel"""
+        return self._spaxels[spaxel_number].xy_coordinates
+
+    def get_all_ccd_coordinates(self, wavelength):
         """Return the CCD coordinates of every spaxel at the given wavelength
 
         The coordinates will be sorted by the spaxel number to ensure a
@@ -597,146 +908,29 @@ class OpticalModel():
 
         return all_x, all_y
 
+    def get_ccd_coordinates(self, spaxel_number, wavelength):
+        """Return the CCD coordinates of a spaxel at the given wavelength"""
+        return self._spaxels[spaxel_number].get_ccd_coordinates(wavelength)
+
     def scatter_ccd_coordinates(self, wavelength, *args, **kwargs):
         """Make a scatter plot of the CCD positions of all of the spaxels at a
         given wavelength.
         """
-        all_x, all_y = self.get_ccd_coordinates(wavelength)
+        all_x, all_y = self.get_all_ccd_coordinates(wavelength)
         plt.scatter(all_x, all_y, *args, **kwargs)
 
-    def find_global_shifts_from_arc(self, arc_data, wavelength, search_x=10,
-                                    search_y=20):
-        """Find the global shifts to line up with spaxel positions from an arc.
+    def update(self, new_spaxel_data):
+        """Update the optical model.
 
-        This function will move the spaxel positions around in the x/y
-        direction as a block and is intented to be used for initial alignment.
-        This will only work if the target arc is the brightest thing within the
-        given search box.
+        new_spaxel_data should be a dictionary with spaxel numbers as keys and
+        SpaxelModel parameters as values. The SpaxelModel will be updated with
+        whatever new information is there... make sure that everything is kept
+        consistent! (eg: don't update the x and y array without updating the
+        wavelength array)
         """
-        all_shift_x = []
-        all_shift_y = []
-
-        print("Fitting for global shifts from arc")
-
-        for spaxel_number, spaxel in tqdm.tqdm(self._spaxels.items()):
-            start_x, start_y = spaxel.get_ccd_coordinates(wavelength)
-
-            fit_results = fit_convgauss_2d(
-                arc_data, start_x, start_y, search_x, search_y,
-                start_sigma_x=1., start_sigma_y=1.
-            )
-
-            fit_x = fit_results['x']
-            fit_y = fit_results['y']
-
-            shift_x = fit_x - start_x
-            shift_y = fit_y - start_y
-
-            spaxel.apply_shift(shift_x, shift_y)
-
-            all_shift_x.append(shift_x)
-            all_shift_y.append(shift_y)
-
-        all_shift_x = np.array(all_shift_x)
-        all_shift_y = np.array(all_shift_y)
-
-        print("    X shifts: median = %5.2f, min = %5.2f, max = %5.2f" %
-              (np.median(all_shift_x), np.min(all_shift_x),
-               np.max(all_shift_x)))
-        print("    Y shifts: median = %5.2f, min = %5.2f, max = %5.2f" %
-              (np.median(all_shift_y), np.min(all_shift_y),
-               np.max(all_shift_y)))
-
-    def identify_arc_lines(self, arc_data, arc_wave):
-        """Identify arc line locations based on a rough optical model.
-
-        Returns an astropy Table with the following columns:
-        - wave
-        - arc_x
-        - arc_y
-        - model_x
-        - model_y
-        - spaxel_i
-        - spaxel_j
-        - spaxel_number
-
-        Note that there may be some misassociations.
-        """
-
-        # First, find the arc line locations using sep.
-        # sep requires a specific byte order which fits files are rarely in.
-        # Swap the byte order if necessary.
-        if arc_data.dtype == '>f4':
-            arc_data = arc_data.byteswap().newbyteorder()
-
-        # Background. We will pick up some of the slit light here, so we use a
-        # big box in order to mitigate the effect of that. So long as the
-        # background is smooth and gives an image with roughly zero mean we are
-        # OK here since the arcs are much brighter than the continuum. Do NOT
-        # use a background like this for analysis of slit data!
-        background = sep.Background(arc_data, bw=256, bh=256)
-
-        sub_data = arc_data - background.back()
-        objects = sep.extract(sub_data, 10.0, minarea=4)
-        arc_x = objects['x']
-        arc_y = objects['y']
-
-        # Determine the line locations in the optical model.
-        model_x_2d, model_y_2d = self.get_ccd_coordinates(arc_wave)
-        num_spaxels = model_x_2d.shape[0]
-        model_x = model_x_2d.flatten()
-        model_y = model_y_2d.flatten()
-        model_lambda = np.tile(arc_wave, num_spaxels)
-
-        spaxel_i_single, spaxel_j_single = self.get_ij_coordinates()
-        spaxel_numbers_single = sorted(self._spaxels.keys())
-        spaxel_i = np.repeat(spaxel_i_single, len(arc_wave))
-        spaxel_j = np.repeat(spaxel_j_single, len(arc_wave))
-        spaxel_numbers = np.repeat(spaxel_numbers_single, len(arc_wave))
-
-        # Initial catalog match. I scale the y direction slightly when doing
-        # matches because the true arc spacing is much larger in that
-        # direction. This allows for larger offsets without failure.
-        y_scale = 3.
-        kdtree_arc = KDTree(np.vstack([arc_x, arc_y / y_scale]).T)
-        dist, matches = kdtree_arc.query(
-            np.vstack([model_x, model_y / y_scale]).T
-        )
-
-        match_arc_x = arc_x[matches]
-        match_arc_y = arc_y[matches]
-
-        result = Table({
-            'wave': model_lambda,
-            'arc_x': match_arc_x,
-            'arc_y': match_arc_y,
-            'model_x': model_x,
-            'model_y': model_y,
-            'spaxel_i': spaxel_i,
-            'spaxel_j': spaxel_j,
-            'spaxel_number': spaxel_numbers,
-        })
-
-        return result
-
-    def align_to_arc(self, arc_data, arc_wave):
-        """Align the optical model to an arc"""
-
-        data = self.identify_arc_lines(arc_data, arc_wave)
-
-        # TODO: This function hasn't been updated for the new fitting method.
-        # Redo it somehow.
-        raise OpticalModelException('align_to_arc outdated! Fix it!')
-
-        def fit_transformation(x):
-            pass
-
-        trans_x, trans_y = fit_transformation(
-            data['arc_x'], data['arc_y'], data['model_x'], data['model_y'],
-            data['spaxel_i'], data['spaxel_j'], data['wave']
-        )
-
-        return trans_x, trans_y
+        for spaxel_number, iter_new_spaxel_data in new_spaxel_data.items():
+            spaxel = self._spaxels[spaxel_number]
+            spaxel.update(**iter_new_spaxel_data)
 
 
 def convgauss(x, amp, mu, sigma):
@@ -782,14 +976,8 @@ def convgauss_2d(mesh_x, mesh_y, amp, mu_x, mu_y, sigma_x, sigma_y):
         convgauss(mesh_y, amp, mu_y, sigma_y)
     )
 
-def lorentzcorr(x):
-    relamp = 0.06
-    gamma = 6.
-    return relamp / (np.pi * gamma * (1 + (x / gamma)**2))
 
-
-def fit_convgauss(data, y, start_mu, search_mu, start_sigma, search_sigma,
-                  lorentzian=False):
+def fit_convgauss(data, y, start_mu, search_mu, start_sigma, search_sigma):
     """Fit a 1D gaussian convolved with a pixel to data"""
     fit_min_mu = int(np.around(start_mu - search_mu))
     fit_max_mu = int(np.around(start_mu + search_mu))
@@ -804,9 +992,6 @@ def fit_convgauss(data, y, start_mu, search_mu, start_sigma, search_sigma,
 
     def model(amp, mu, sigma, mean):
         model = convgauss(x_vals, amp, mu, sigma) + mean
-
-        if lorentzian:
-            model += amp * lorentzcorr(x_vals - mu)
 
         return model
 

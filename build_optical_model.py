@@ -6,9 +6,12 @@ from collections import defaultdict
 from scipy.interpolate import InterpolatedUnivariateSpline
 
 from optical_model import OpticalModel, OpticalModelTransformation, \
-    SpaxelModelFitter
+    SpaxelModelFitter, IfuCcdImage, OpticalModelException
 
 plt.ion()
+
+class OpticalModelBuildException(OpticalModelException):
+    pass
 
 
 # Set up the default optical model
@@ -24,6 +27,7 @@ spaxel_coordinates = np.genfromtxt('./spaxel_coordinates.txt')
 
 spaxel_data = {}
 
+print("Loading analytic optical model")
 for spaxel in np.unique(optics_spaxel):
     match = optics_spaxel == spaxel
 
@@ -37,58 +41,33 @@ for spaxel in np.unique(optics_spaxel):
     slice_ymla = optics_ymla[match]
     slice_lambda = optics_lambda[match]
 
-    slice_sigma = np.ones(len(slice_xccd))
+    slice_width = np.ones(len(slice_xccd))
 
     match_2 = np.where((spaxel_coordinates[:, 0] == spaxel))[0][0]
     spaxel_i, spaxel_j = spaxel_coordinates[match_2, 1:]
 
     spaxel_data[spaxel] = {
-        'number': spaxel,
-        'i_coord': spaxel_i,
-        'j_coord': spaxel_j,
-        'x_mla': slice_xmla,
-        'y_mla': slice_ymla,
-        'wave': slice_lambda,
-        'x_ccd': slice_xccd,
-        'y_ccd': slice_yccd,
-        'sigma': slice_sigma
+        'spaxel_number': spaxel,
+        'spaxel_i': spaxel_i.astype(int),
+        'spaxel_j': spaxel_j.astype(int),
+        'spaxel_x': spaxel_i,
+        'spaxel_y': spaxel_j,
+        'wavelength': slice_lambda,
+        'ccd_x': slice_xccd,
+        'ccd_y': slice_yccd,
+        'width': slice_width
     }
 
 optical_model = OpticalModel(spaxel_data)
 
 
-# Load test data
-arc_lines = [
-    # 3252.52392578,
-    3261.05493164,          # GOOD
-    # 3341.4839,
-    # 3403.65209961,
-    3466.19995117,          # GOOD
-    # 3467.6550293,
-    3610.50805664,          # GOOD
-    # 3612.87304688,
-    # 3650.15795898,
-    # 3654.84008789,
-    4046.56494141,          # GOOD
-    4077.8369,              # GOOD
-    # 4158.58984375,     why is this bad? Looks great but comes out off by
-    #                    around 0.2 in Y!
-    # 4200.67382812,
-    # 4347.50585938,
-    4358.33496094,          # GOOD
-    # 4678.1489,
-    4799.91210938,          # GOOD
-    5085.82177734,          # GOOD
-    # 5460.75,
-]
-
+# Align several images to each other.
 filenames = [
     # Ref
-    ('./data/P08_231_109_010_07_B.fits', './data/P08_231_109_011_03_B.fits'),
-
     ('./data/P05_139_046_010_07_B.fits', './data/P05_139_046_011_03_B.fits'),
     ('./data/P06_151_149_010_07_B.fits', './data/P06_151_149_011_03_B.fits'),
     ('./data/P07_110_148_002_07_B.fits', './data/P07_110_148_003_03_B.fits'),
+    ('./data/P08_231_109_010_07_B.fits', './data/P08_231_109_011_03_B.fits'),
     ('./data/P09_184_174_010_07_B.fits', './data/P09_184_172_011_03_B.fits'),
     ('./data/P10_172_091_010_07_B.fits', './data/P10_172_091_011_03_B.fits'),
     ('./data/P11_267_082_002_07_B.fits', './data/P11_267_082_003_03_B.fits'),
@@ -99,259 +78,132 @@ filenames = [
     # ('./data/P15_089_087_010_07_B.fits', './data/P15_089_087_011_03_B.fits'),
 ]
 
-ref_idx = 0
+ref_idx = 3
 
 arc_images = []
-arc_datas = []
-
 cont_images = []
 
-for cont_filename, arc_filename in filenames:
-    print(arc_filename)
-    arc_file = fits.open(arc_filename)
-    arc_image = arc_file[0].data
+ref_cont_filename, ref_arc_filename = filenames[ref_idx]
+
+print("Using %s as the reference arc" % ref_arc_filename)
+
+ref_arc_image = IfuCcdImage(ref_arc_filename, optical_model)
+
+all_arc_data = []
+
+for i, (cont_filename, arc_filename) in enumerate(filenames):
+    if i == ref_idx:
+        arc_image = ref_arc_image
+        arc_data = arc_image.get_arc_data()
+
+        arc_data['ref_ccd_x'] = arc_data['ccd_x']
+        arc_data['ref_ccd_y'] = arc_data['ccd_y']
+    else:
+        print("Aligning %s to %s" % (arc_filename, ref_arc_filename))
+
+        arc_image = IfuCcdImage(arc_filename, optical_model)
+        arc_image.align_to_arc_image(ref_arc_image)
+
+        arc_data = arc_image.get_arc_data()
+
+        # Transform the arc data into the reference coordinate frame.
+        ref_ccd_x, ref_ccd_y = arc_image.transform_ccd_to_model(
+            arc_data['ccd_x'], arc_data['ccd_y'], arc_data['spaxel_x'],
+            arc_data['spaxel_y'], arc_data['wavelength']
+        )
+        arc_data['ref_ccd_x'] = ref_ccd_x
+        arc_data['ref_ccd_y'] = ref_ccd_y
+
+    arc_data['image_index'] = i
+
     arc_images.append(arc_image)
 
-    arc_data = optical_model.identify_arc_lines(arc_image, arc_lines)
-    arc_datas.append(arc_data)
+    all_arc_data.append(arc_data)
 
-    arc_file.close()
-
-    cont_file = fits.open(cont_filename)
-    cont_image = cont_file[0].data
-    cont_images.append(cont_image)
+all_arc_data = np.hstack(all_arc_data)
 
 
-
-transformations = [None]
-ref_arc_data = arc_datas[ref_idx]
-
-spaxel_xs = defaultdict(list)
-spaxel_ys = defaultdict(list)
-spaxel_waves = defaultdict(list)
-
-ref_arc_data['trans_x'] = ref_arc_data['arc_x']
-ref_arc_data['trans_y'] = ref_arc_data['arc_y']
-
-for i, arc_data in enumerate(arc_datas):
-    arc_data['sample_number'] = i
-
-    if i == ref_idx:
-        continue
-
-    join_arc_data = join(ref_arc_data, arc_data, ['spaxel_i', 'spaxel_j',
-                                                  'wave'])
-
-    trans = OpticalModelTransformation()
-    trans_x, trans_y = trans.fit(
-        join_arc_data['arc_x_1'],
-        join_arc_data['arc_y_1'],
-        join_arc_data['arc_x_2'],
-        join_arc_data['arc_y_2'],
-        join_arc_data['spaxel_i'],
-        join_arc_data['spaxel_j'],
-        join_arc_data['wave'],
-        order=3
-    )
-
-    from idrtools import math
-    c = join_arc_data
-    print(i,
-          math.nmad(c['arc_x_1'] - c['arc_x_2']),
-          math.nmad(c['arc_y_1'] - c['arc_y_2']),
-          math.nmad(c['arc_x_1'] - trans_x),
-          math.nmad(c['arc_y_1'] - trans_y))
-
-    transformations.append(trans)
-
-    # Transform lines that didn't find a match
-    full_trans_x, full_trans_y = trans.transform(
-        arc_data['arc_x'],
-        arc_data['arc_y'],
-        arc_data['spaxel_i'],
-        arc_data['spaxel_j'],
-        arc_data['wave']
-    )
-
-    for iter_trans_x, iter_trans_y, iter_arc_data in \
-            zip(full_trans_x, full_trans_y, arc_data):
-        spaxel_number = iter_arc_data['spaxel_number']
-        spaxel_xs[spaxel_number].append(iter_trans_x)
-        spaxel_ys[spaxel_number].append(iter_trans_y)
-        spaxel_waves[spaxel_number].append(iter_arc_data['wave'])
-
-    arc_data['trans_x'] = full_trans_x
-    arc_data['trans_y'] = full_trans_y
-
-# Triple transform test
-# trans_x_1, trans_y_1 = transformations[0][7].transform(
-    # c['arc_x_2'], c['arc_y_2'], c['spaxel_i'], c['spaxel_j'], c['wave']
-# )
-# trans_x_2, trans_y_2 = transformations[4][0].transform(
-    # trans_x_1, trans_y_1, c['spaxel_i'], c['spaxel_j'], c['wave']
-# )
-# trans_x_3, trans_y_3 = transformations[7][4].transform(
-    # trans_x_2, trans_y_2, c['spaxel_i'], c['spaxel_j'], c['wave']
-# )
+print('Fitting for initial model')
+initial_model = OpticalModelTransformation()
+initial_fit_x, initial_fit_y = initial_model.fit(
+    all_arc_data['ref_ccd_x'],
+    all_arc_data['ref_ccd_y'],
+    np.zeros(len(all_arc_data)),
+    np.zeros(len(all_arc_data)),
+    all_arc_data['spaxel_x'],
+    all_arc_data['spaxel_y'],
+    all_arc_data['wavelength'],
+    order=5,
+    verbose=True
+)
 
 
-stack_data = np.hstack(arc_datas)
+def plot_initial_model_test(spaxel_i, spaxel_j, mode=0, new_figure=True):
+    """Do a test plot of the initial model.
 
-
-def get_data(spaxel_i, spaxel_j):
+    Modes:
+        0: x
+        1: y
+    """
     cut = (
-        (np.abs(stack_data['spaxel_i'] - spaxel_i) < 0.5) &
-        (np.abs(stack_data['spaxel_j'] - spaxel_j) < 0.5)
+        (all_arc_data['spaxel_i'] == spaxel_i) &
+        (all_arc_data['spaxel_j'] == spaxel_j)
     )
 
-    return stack_data[cut]
+    cut_arc_data = all_arc_data[cut]
+
+    if len(cut_arc_data) == 0:
+        raise OpticalModelBuildException("No data found for spaxel (%d, %d)" %
+                                         (spaxel_i, spaxel_j))
+
+    spaxel_x = cut_arc_data[0]['spaxel_x']
+    spaxel_y = cut_arc_data[0]['spaxel_y']
+
+    wave = np.arange(2500, 6000)
+
+    model_x, model_y = initial_model.transform(0., 0., spaxel_x, spaxel_y,
+                                               wave)
+
+    # Figure out what to plot
+    to_scatter_x = cut_arc_data['wavelength']
+    to_scatter_c = cut_arc_data['image_index']
+
+    if mode == 0:
+        model = model_x
+        to_scatter_y = cut_arc_data['ref_ccd_x']
+    elif mode == 1:
+        model = model_y
+        to_scatter_y = cut_arc_data['ref_ccd_y']
+
+    if new_figure:
+        plt.figure()
+
+    plt.plot(wave, model, label='Initial model fit')
+    plt.scatter(to_scatter_x, to_scatter_y, c=to_scatter_c, label='Arc data')
+    plt.xlabel('Wavelength $\AA$')
+    plt.ylabel('Pixels')
+    plt.legend()
 
 
-initial_spaxel_l2xs = {}
-initial_spaxel_l2ys = {}
+print("Doing initial optical model update from arcs")
+optical_model_wavelength = np.arange(2500, 6000, 20.)
 
-arc_profiles = []
-arc_dx = []
-arc_i = []
-arc_j = []
+new_spaxel_data = {}
 
-for spaxel_i in range(-7, 8):
-    for spaxel_j in range(-7, 8):
-        spaxel_data = get_data(spaxel_i, spaxel_j)
-        if len(spaxel_data) == 0:
-            continue
+for spaxel_number in optical_model.spaxel_numbers:
+    spaxel_x, spaxel_y = \
+        optical_model.get_spaxel_xy_coordinates(spaxel_number)
 
-        wave = spaxel_data['wave']
-        val = spaxel_data['trans_y']
-        # orig = spaxel_data['model_y']
+    model_x, model_y = initial_model.transform(0., 0., spaxel_x, spaxel_y,
+                                               optical_model_wavelength)
 
-        # Note: need around order 5 or so to fully capture the model. However
-        # we don't have enough arc lines to do that in a principled way.
-        initial_model_x = SpaxelModelFitter()
-        initial_model_y = SpaxelModelFitter()
-        model_x_vals = initial_model_x.fit(wave, spaxel_data['trans_x'], 3)
-        model_y_vals = initial_model_y.fit(wave, spaxel_data['trans_y'], 3)
+    width = np.ones(len(optical_model_wavelength))
 
-        initial_spaxel_l2xs[spaxel_data[0]['spaxel_number']] = initial_model_x
-        initial_spaxel_l2ys[spaxel_data[0]['spaxel_number']] = initial_model_y
+    new_spaxel_data[spaxel_number] = {
+        'wavelength': optical_model_wavelength,
+        'ccd_x': model_x,
+        'ccd_y': model_y,
+        'width': width,
+    }
 
-
-        # Arc test
-        test_wave = 3650.158
-        arc_image = arc_images[0]
-        arc_x = initial_model_x([test_wave])[0]
-        arc_y = initial_model_y([test_wave])[0]
-
-        x_min = int(arc_x) - 50
-        x_max = int(arc_x) + 50
-        y_min = int(arc_y) - 10
-        y_max = int(arc_y) + 10
-        x_win = np.arange(x_min, x_max)
-        y_win = np.arange(y_min, y_max)
-
-        dx = x_win - arc_x
-
-        arc_profile = np.sum(arc_image[y_min:y_max, x_min:x_max], axis=0)
-
-        if len(arc_profile) != len(dx):
-            continue
-        
-        arc_profiles.append(arc_profile)
-        arc_dx.append(dx)
-        arc_i.append(spaxel_i)
-        arc_j.append(spaxel_j)
-
-arc_profiles = np.vstack(arc_profiles)
-arc_dx = np.vstack(arc_dx)
-
-
-cause.exception
-
-# plt.imshow(cont_images[0], vmin=-10, vmax=5000)
-
-idx = 3
-# for idx in range(1, len(cont_images)):
-test_im = cont_images[idx]
-transformation = transformations[idx]
-
-residual_im = test_im.copy()
-
-for spaxel_number in initial_spaxel_l2xs.keys():
-    break
-    # Fit to the continuum
-
-    use_wave = np.arange(3500, 5200)
-
-    x = initial_spaxel_l2xs[spaxel_number](use_wave)
-    y = initial_spaxel_l2ys[spaxel_number](use_wave)
-
-    print(spaxel_number, x[500])
-    # plt.scatter(x[500], y[500])
-
-    break
-
-    bla = stack_data[stack_data['spaxel_number'] == spaxel_number]
-
-    trans_x, trans_y = transformation.transform(
-        x,
-        y,
-        bla['spaxel_i'][0],
-        bla['spaxel_j'][0],
-        use_wave,
-        reverse=True
-    )
-
-    order = np.argsort(trans_y)
-    trans_x = trans_x[order]
-    trans_y = trans_y[order]
-    trans_wave = use_wave[order]
-    
-
-    y2x = InterpolatedUnivariateSpline(trans_y, trans_x)
-    y2wave = InterpolatedUnivariateSpline(trans_y, trans_wave)
-
-
-    # plt.plot(x, y, c='C0')
-    # plt.plot(trans_x, trans_y, c='C1')
-
-    min_y = int(np.min(trans_y))
-    max_y = int(np.max(trans_y))
-
-    from optical_model import fit_convgauss, OpticalModelFitException
-    all_dx = []
-    all_x = []
-    all_dx_model = []
-    all_sig = []
-    all_wave = []
-    all_y = np.arange(min_y, max_y)
-    all_c = []
-    for iter_y in all_y:
-        if iter_y % 100 == 0:
-            print(iter_y, y2wave(iter_y))
-        # print(iter_y, y2wave(iter_y))
-        fit_x_start = y2x(iter_y)
-        try:
-            res = fit_convgauss(test_im, iter_y, fit_x_start, 5, 2, 1.5)
-
-            all_dx.append(res['mu'] - fit_x_start)
-            all_dx_model.append(
-                res['mu'] -
-                optical_model._spaxels[spaxel_number]._interp_wave_to_x(y2wave(iter_y))
-            )
-            all_sig.append(res['sigma'])
-            all_wave.append(y2wave(iter_y))
-            all_x.append(res['mu'])
-
-            residual_im[res['model_y'], res['model_x']] -= res['model_no_mean']
-        except OpticalModelFitException:
-            print("FAIL")
-            all_dx.append(np.nan)
-            all_dx_model.append(np.nan)
-            all_sig.append(np.nan)
-            all_wave.append(np.nan)
-            all_x.append(np.nan)
-
-
-
-    # plt.scatter(all_x, all_y)
-    # plt.plot(all_wave, all_dx)
+optical_model.update(new_spaxel_data)
