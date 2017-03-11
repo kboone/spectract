@@ -273,6 +273,47 @@ class IfuCcdImage():
 
         return ccd_x, ccd_y
 
+    def get_all_ccd_coordinates(self, wavelength, apply_transformation=True):
+        """Get the CCD coordinates for all spaxels at a given wavelength.
+
+        The coordinates will be sorted by the spaxel number to ensure a
+        consistent order.
+
+        If apply_transformation is True, the image transformation from the
+        model CCD coordinates to image CCD coordinates will be applied.
+        """
+
+        # Calculate the model x and y coordinates.
+        model_x, model_y = \
+            self._optical_model.get_all_ccd_coordinates(wavelength)
+
+        if apply_transformation and self._transformation is not None:
+            spaxel_x, spaxel_y = \
+                self._optical_model.get_all_spaxel_xy_coordinates()
+
+            ccd_x, ccd_y = self.transform_model_to_ccd(
+                model_x,
+                model_y,
+                spaxel_x,
+                spaxel_y,
+                wavelength,
+            )
+        else:
+            ccd_x = model_x
+            ccd_y = model_y
+
+        return ccd_x, ccd_y
+
+    def scatter_ccd_coordinates(self, wavelength, *args,
+                                apply_transformation=True, **kwargs):
+        """Make a scatter plot of the CCD positions of all of the spaxels at a
+        given wavelength.
+        """
+        all_x, all_y = self.get_all_ccd_coordinates(
+            wavelength, apply_transformation=apply_transformation
+        )
+        plt.scatter(all_x, all_y, *args, **kwargs)
+
     def transform_ccd_to_model(self, ccd_x, ccd_y, spaxel_x, spaxel_y,
                                wavelength):
         """Transform CCD coordinates to model CCD coordinates."""
