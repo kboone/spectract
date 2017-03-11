@@ -86,6 +86,14 @@ class IfuCcdImage():
 
         self.__arc_data = None
 
+    def load_image_with_transformation(self, path):
+        """Load an image and transfer the transformation from this image to it.
+        """
+        new_image = IfuCcdImage(path, self._optical_model,
+                                self._transformation)
+
+        return new_image
+
     def plot(self, **kwargs):
         data = self._fits_file[0].data
 

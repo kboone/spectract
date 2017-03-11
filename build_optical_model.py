@@ -62,7 +62,7 @@ optical_model = OpticalModel(spaxel_data)
 
 
 # Align several images to each other.
-filenames = [
+paths = [
     # Ref
     ('./data/P05_139_046_010_07_B.fits', './data/P05_139_046_011_03_B.fits'),
     ('./data/P06_151_149_010_07_B.fits', './data/P06_151_149_011_03_B.fits'),
@@ -80,29 +80,32 @@ filenames = [
 
 ref_idx = 3
 
+ref_cont_path, ref_arc_path = paths[ref_idx]
+
+print("Using %s as the reference arc" % ref_arc_path)
+
+ref_arc_image = IfuCcdImage(ref_arc_path, optical_model)
+ref_cont_image = IfuCcdImage(ref_cont_path, optical_model)
+
+all_arc_data = []
 arc_images = []
 cont_images = []
 
-ref_cont_filename, ref_arc_filename = filenames[ref_idx]
-
-print("Using %s as the reference arc" % ref_arc_filename)
-
-ref_arc_image = IfuCcdImage(ref_arc_filename, optical_model)
-
-all_arc_data = []
-
-for i, (cont_filename, arc_filename) in enumerate(filenames):
+for i, (cont_path, arc_path) in enumerate(paths):
     if i == ref_idx:
         arc_image = ref_arc_image
+        cont_image = ref_cont_image
         arc_data = arc_image.get_arc_data()
 
         arc_data['ref_ccd_x'] = arc_data['ccd_x']
         arc_data['ref_ccd_y'] = arc_data['ccd_y']
     else:
-        print("Aligning %s to %s" % (arc_filename, ref_arc_filename))
+        print("Aligning %s to %s" % (arc_path, ref_arc_path))
 
-        arc_image = IfuCcdImage(arc_filename, optical_model)
+        arc_image = IfuCcdImage(arc_path, optical_model)
         arc_image.align_to_arc_image(ref_arc_image)
+
+        cont_image = arc_image.load_image_with_transformation(cont_path)
 
         arc_data = arc_image.get_arc_data()
 
@@ -117,13 +120,13 @@ for i, (cont_filename, arc_filename) in enumerate(filenames):
     arc_data['image_index'] = i
 
     arc_images.append(arc_image)
-
+    cont_images.append(cont_image)
     all_arc_data.append(arc_data)
 
 all_arc_data = np.hstack(all_arc_data)
 
 
-print('Fitting for initial model')
+print('Fitting for initial optical model update from arcs')
 initial_model = OpticalModelTransformation()
 initial_fit_x, initial_fit_y = initial_model.fit(
     all_arc_data['ref_ccd_x'],
@@ -185,7 +188,7 @@ def plot_initial_model_test(spaxel_i, spaxel_j, mode=0, new_figure=True):
     plt.legend()
 
 
-print("Doing initial optical model update from arcs")
+print("Applying initial optical model update from arcs")
 optical_model_wavelength = np.arange(2500, 6000, 20.)
 
 new_spaxel_data = {}
