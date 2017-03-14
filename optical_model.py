@@ -79,23 +79,23 @@ def _calculate_transformation_components_1(x, order):
 
 class IfuCcdImage():
     def __init__(self, path, optical_model, transformation=None):
-        self._path = path
-        self._fits_file = fits.open(path)
-        self._optical_model = optical_model
-        self._transformation = transformation
+        self.path = path
+        self.fits_file = fits.open(path)
+        self.optical_model = optical_model
+        self.transformation = transformation
 
         self.__arc_data = None
 
     def load_image_with_transformation(self, path):
         """Load an image and transfer the transformation from this image to it.
         """
-        new_image = IfuCcdImage(path, self._optical_model,
-                                self._transformation)
+        new_image = IfuCcdImage(path, self.optical_model,
+                                self.transformation)
 
         return new_image
 
     def plot(self, **kwargs):
-        data = self._fits_file[0].data
+        data = self.fits_file[0].data
 
         if 'vmin' not in kwargs:
             kwargs['vmin'] = np.percentile(data, 1.)
@@ -125,7 +125,7 @@ class IfuCcdImage():
 
         Note that there may be some misassociations.
         """
-        data = self._fits_file[0].data
+        data = self.fits_file[0].data
 
         # First, find the arc line locations using sep.
         # sep requires a specific byte order which fits files are rarely in.
@@ -147,18 +147,18 @@ class IfuCcdImage():
 
         # Determine the line locations in the optical model.
         model_x_2d, model_y_2d = \
-            self._optical_model.get_all_ccd_coordinates(arc_wavelength)
+            self.optical_model.get_all_ccd_coordinates(arc_wavelength)
         num_spaxels = model_x_2d.shape[0]
         model_x = model_x_2d.flatten()
         model_y = model_y_2d.flatten()
         model_lambda = np.tile(arc_wavelength, num_spaxels)
 
         spaxel_x_single, spaxel_y_single = \
-            self._optical_model.get_all_spaxel_xy_coordinates()
+            self.optical_model.get_all_spaxel_xy_coordinates()
         spaxel_i_single, spaxel_j_single = \
-            self._optical_model.get_all_spaxel_ij_coordinates()
+            self.optical_model.get_all_spaxel_ij_coordinates()
 
-        spaxel_numbers_single = sorted(self._optical_model._spaxels.keys())
+        spaxel_numbers_single = sorted(self.optical_model._spaxels.keys())
 
         spaxel_i = np.repeat(spaxel_i_single, len(arc_wavelength))
         spaxel_j = np.repeat(spaxel_j_single, len(arc_wavelength))
@@ -250,7 +250,7 @@ class IfuCcdImage():
             order=3
         )
 
-        self._transformation = transformation
+        self.transformation = transformation
 
     def get_ccd_coordinates(self, spaxel_number, wavelength,
                             apply_transformation=True):
@@ -262,11 +262,11 @@ class IfuCcdImage():
 
         # Calculate the model x and y coordinates.
         model_x, model_y = \
-            self._optical_model.get_ccd_coordinates(spaxel_number, wavelength)
+            self.optical_model.get_ccd_coordinates(spaxel_number, wavelength)
 
-        if apply_transformation and self._transformation is not None:
+        if apply_transformation and self.transformation is not None:
             spaxel_x, spaxel_y = \
-                self._optical_model.get_spaxel_xy_coordinates(spaxel_number)
+                self.optical_model.get_spaxel_xy_coordinates(spaxel_number)
 
             ccd_x, ccd_y = self.transform_model_to_ccd(
                 model_x,
@@ -293,11 +293,11 @@ class IfuCcdImage():
 
         # Calculate the model x and y coordinates.
         model_x, model_y = \
-            self._optical_model.get_all_ccd_coordinates(wavelength)
+            self.optical_model.get_all_ccd_coordinates(wavelength)
 
-        if apply_transformation and self._transformation is not None:
+        if apply_transformation and self.transformation is not None:
             spaxel_x, spaxel_y = \
-                self._optical_model.get_all_spaxel_xy_coordinates()
+                self.optical_model.get_all_spaxel_xy_coordinates()
 
             ccd_x, ccd_y = self.transform_model_to_ccd(
                 model_x,
@@ -326,11 +326,11 @@ class IfuCcdImage():
                                wavelength):
         """Transform CCD coordinates to model CCD coordinates."""
 
-        if self._transformation is None:
+        if self.transformation is None:
             # No transformation defined
             return ccd_x, ccd_y
 
-        model_x, model_y = self._transformation.transform(
+        model_x, model_y = self.transformation.transform(
             ccd_x,
             ccd_y,
             spaxel_x,
@@ -345,11 +345,11 @@ class IfuCcdImage():
                                wavelength):
         """Transform model CCD coordinates to CCD coordinates."""
 
-        if self._transformation is None:
+        if self.transformation is None:
             # No transformation defined
             return model_x, model_y
 
-        ccd_x, ccd_y = self._transformation.transform(
+        ccd_x, ccd_y = self.transformation.transform(
             model_x,
             model_y,
             spaxel_x,
@@ -370,20 +370,19 @@ class IfuCcdImage():
         center_x, center_y = \
             self.get_ccd_coordinates(spaxel_number, wavelength)
 
-        int_center_y = int(np.around(center_y))
-        int_center_x = int(np.around(center_x))
+        min_x = int(np.around(center_x - width_x))
+        max_x = int(np.around(center_x + width_x))
+        min_y = int(np.around(center_y - width_y))
+        max_y = int(np.around(center_y + width_y))
 
-        x_vals = np.arange(int_center_x - width_x, int_center_x + width_x + 1)
-        y_vals = np.arange(int_center_y - width_y, int_center_y + width_y + 1)
+        x_vals = np.arange(min_x, max_x + 1)
+        y_vals = np.arange(min_y, max_y + 1)
         dx_vals = x_vals - center_x
         dy_vals = y_vals - center_y
 
-        data = self._fits_file[0].data
+        data = self.fits_file[0].data
 
-        patch = data[
-            int_center_y - width_y:int_center_y + width_y + 1,
-            int_center_x - width_x:int_center_x + width_x + 1,
-        ]
+        patch = data[min_y:max_y + 1, min_x:max_x + 1]
 
         return dx_vals, dy_vals, patch
 
@@ -1043,6 +1042,47 @@ def convgauss(x, amp, mu, sigma):
         )
     )
 
+def convgauss_gradient(x, amp, mu, sigma, gradient_index):
+    """Evaluate the gradient of a 1d gaussian convolved with a pixel.
+
+    - x is a 1d array of the x positions.
+    - amp is the integral of the gaussian.
+    - mu is the center position.
+    - sigma is the standard deviation of the Gaussian.
+    - gradient_index is the index of the parameter to take the gradient of.
+    """
+    if gradient_index == 0:
+        # amp. This is easy since amp is just a constant scaling.
+        return convgauss(x, amp, mu, sigma) / amp
+    elif gradient_index == 1:
+        # mu. For this and for sigma we need to work with derivatives of the
+        # error function. I worked these out analytically.
+        return (
+            amp * 0.5 * (-1. / (np.sqrt(2) * sigma)) * 2 / np.sqrt(np.pi) * (
+                np.exp(-((x + 0.5 - mu) / (np.sqrt(2) * sigma))**2) - 
+                np.exp(-((x - 0.5 - mu) / (np.sqrt(2) * sigma))**2)
+            )
+        )
+    elif gradient_index == 2:
+        # sigma
+        return (
+            amp * 0.5 * (-1. / np.sqrt(2) / sigma**2) * 2 / np.sqrt(np.pi) * (
+                (
+                    (x + 0.5 - mu) *
+                    np.exp(-((x + 0.5 - mu) / (np.sqrt(2) * sigma))**2)
+                ) - (
+                    (x - 0.5 - mu) *
+                    np.exp(-((x - 0.5 - mu) / (np.sqrt(2) * sigma))**2)
+                )
+            )
+        )
+
+    # Shouldn't make it here... invalid index
+    raise OpticalModelFitException("Invalid gradient index %d!" %
+                                   gradient_index)
+
+
+
 
 def multigauss(amp1, mu1, sigma1, amp2, mu2, sigma2):
     """Determine parameters of one gaussian convolved with another.
@@ -1072,7 +1112,103 @@ def convgauss_2d(mesh_x, mesh_y, amp, mu_x, mu_y, sigma_x, sigma_y):
     )
 
 
-def fit_convgauss(data, y, start_mu, search_mu, start_sigma, search_sigma):
+def fit_convgauss(x, y, start_mu, search_mu, start_sigma, search_sigma):
+    """Fit a 1D gaussian convolved with a pixel to data"""
+    fit_min_mu = start_mu - search_mu
+    fit_max_mu = start_mu + search_mu
+    fit_min_sigma = start_sigma - search_sigma
+    fit_max_sigma = start_sigma + search_sigma
+
+    def model(amp, mu, sigma, mean):
+        model = convgauss(x, amp, mu, sigma) + mean
+
+        return model
+
+    def fit_func(params):
+        return np.sum((y - model(*params))**2)
+
+    def model_gradient(amp, mu, sigma, mean, gradient_index):
+        # This gradient is pretty slow right now. I should probably optimize it
+        # or do it in cython or something.
+        if gradient_index == 3:
+            # mean
+            return np.ones(len(x))
+        else:
+            return convgauss_gradient(x, amp, mu, sigma, gradient_index)
+
+    def fit_func_gradient(params):
+        fit_model = model(*params)
+
+        gradient = []
+        for i in range(len(params)):
+            gradient.append(
+                np.sum(-2. * (y - fit_model) * model_gradient(*params, i))
+            )
+
+        gradient = np.array(gradient)
+
+        return gradient
+
+    start_amp = np.sum(y)
+
+    start_params = np.array([start_amp, start_mu, start_sigma, 0.])
+    bounds = [
+        (0.1*start_amp, 10*start_amp),
+        (fit_min_mu, fit_max_mu),
+        (fit_min_sigma, fit_max_sigma),
+        (None, None),
+    ]
+
+    res = minimize(
+        fit_func,
+        start_params,
+        jac=fit_func_gradient,
+        method='L-BFGS-B',
+        bounds=bounds
+    )
+
+    if not res.success:
+        raise OpticalModelFitException(res.message)
+
+    fit_params = res.x
+
+    fit_amp, fit_mu, fit_sigma, fit_mean = fit_params
+    result_model = model(*fit_params)
+
+    no_mean_fit_params = fit_params.copy()
+    no_mean_fit_params[-1] = 0.
+    result_model_no_mean = model(*no_mean_fit_params)
+
+    do_print = False
+
+    if fit_amp < 0.5*start_amp or fit_amp > 1.5*start_amp:
+        print("WARNING: Fit amplitude out of normal bounds:")
+        do_print = True
+
+    if do_print:
+        print("Fit results:")
+        print("    Amplitude: %8.2f (start: %8.2f)" % (fit_amp, start_amp))
+        print("    Center:    %8.2f (start: %8.2f)" % (fit_mu, start_mu))
+        print("    Sigma:     %8.2f (start: %8.2f)" % (fit_sigma, start_sigma))
+        print("    Mean:      %8.2f (start: %8.2f)" % (fit_mean, 0.))
+        print("    Residual power fraction: %8.2f" %
+              (np.sum((y - result_model)**2) / np.sum(y**2)))
+
+    return {
+        'amp': fit_amp,
+        'mu': fit_mu,
+        'sigma': fit_sigma,
+        'mean': fit_mean,
+        'model': result_model,
+        'model_no_mean': result_model_no_mean,
+        'x': x,
+        'y': y,
+        'fit_result': res,
+    }
+
+
+def fit_convgauss_full_image(data, y, start_mu, search_mu, start_sigma,
+                             search_sigma):
     """Fit a 1D gaussian convolved with a pixel to data"""
     fit_min_mu = int(np.around(start_mu - search_mu))
     fit_max_mu = int(np.around(start_mu + search_mu))

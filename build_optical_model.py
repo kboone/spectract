@@ -1,14 +1,12 @@
 import numpy as np
-from astropy.io import fits
 from matplotlib import pyplot as plt
-from astropy.table import join
-from collections import defaultdict
-from scipy.interpolate import InterpolatedUnivariateSpline
+from astropy.table import Table
 
 from optical_model import OpticalModel, OpticalModelTransformation, \
-    SpaxelModelFitter, IfuCcdImage, OpticalModelException
+    IfuCcdImage, OpticalModelException, fit_convgauss, OpticalModelFitException
 
 plt.ion()
+
 
 class OpticalModelBuildException(OpticalModelException):
     pass
@@ -127,8 +125,8 @@ all_arc_data = np.hstack(all_arc_data)
 
 
 print('Fitting for initial optical model update from arcs')
-initial_model = OpticalModelTransformation()
-initial_fit_x, initial_fit_y = initial_model.fit(
+initial_model_transformation = OpticalModelTransformation()
+initial_fit_x, initial_fit_y = initial_model_transformation.fit(
     all_arc_data['ref_ccd_x'],
     all_arc_data['ref_ccd_y'],
     np.zeros(len(all_arc_data)),
@@ -164,8 +162,9 @@ def plot_initial_model_test(spaxel_i, spaxel_j, mode=0, new_figure=True):
 
     wave = np.arange(2500, 6000)
 
-    model_x, model_y = initial_model.transform(0., 0., spaxel_x, spaxel_y,
-                                               wave)
+    model_x, model_y = initial_model_transformation.transform(
+        0., 0., spaxel_x, spaxel_y, wave
+    )
 
     # Figure out what to plot
     to_scatter_x = cut_arc_data['wavelength']
@@ -197,8 +196,9 @@ for spaxel_number in optical_model.spaxel_numbers:
     spaxel_x, spaxel_y = \
         optical_model.get_spaxel_xy_coordinates(spaxel_number)
 
-    model_x, model_y = initial_model.transform(0., 0., spaxel_x, spaxel_y,
-                                               optical_model_wavelength)
+    model_x, model_y = initial_model_transformation.transform(
+        0., 0., spaxel_x, spaxel_y, optical_model_wavelength
+    )
 
     width = np.ones(len(optical_model_wavelength))
 
@@ -215,6 +215,70 @@ optical_model.update(new_spaxel_data)
 # Find sigma and x as a function of wavelength
 print("Using continuum images to refine model.")
 
-for i in cont_images:
-    dx, patch = i.get_sum_patch(12, [5000.])
-    plt.scatter(dx, patch / np.sum(patch))
+continuum_datas = []
+
+for cont_image in cont_images:
+    print("Next cont image")
+    fit_wave = []
+
+    fit_mus = []
+    fit_sigmas = []
+    fit_amps = []
+    fit_means = []
+
+    fit_spaxel_xs = []
+    fit_spaxel_ys = []
+    fit_spaxel_is = []
+    fit_spaxel_js = []
+
+    optical_model = cont_image.optical_model
+
+    for spaxel_number in optical_model.spaxel_numbers:
+        print(spaxel_number)
+        if spaxel_number > 20:
+            continue
+
+        for wavelength in np.arange(3200., 6000., 100.):
+            dx, patch = cont_image.get_sum_patch(spaxel_number, [wavelength],
+                                                 width_x=2.5)
+            try:
+                fit = fit_convgauss(dx, patch, 0., 5., 1., 0.8)
+            except OpticalModelFitException:
+                continue
+
+            spaxel_i, spaxel_j = \
+                optical_model.get_spaxel_ij_coordinates(spaxel_number)
+            spaxel_x, spaxel_y = \
+                optical_model.get_spaxel_xy_coordinates(spaxel_number)
+
+            fit_wave.append(wavelength)
+            fit_mus.append(fit['mu'])
+            fit_sigmas.append(fit['sigma'])
+            fit_amps.append(fit['amp'])
+            fit_means.append(fit['mean'])
+
+            fit_spaxel_xs.append(spaxel_x)
+            fit_spaxel_ys.append(spaxel_y)
+            fit_spaxel_is.append(spaxel_i)
+            fit_spaxel_js.append(spaxel_j)
+
+    continuum_data = Table({
+        'wavelength': fit_wave,
+        'offset': fit_mus,
+        'width': fit_sigmas,
+        'amplitude': fit_amps,
+        'background': fit_means,
+        'spaxel_x': fit_spaxel_xs,
+        'spaxel_y': fit_spaxel_ys,
+        'spaxel_i': fit_spaxel_is,
+        'spaxel_j': fit_spaxel_js,
+    })
+
+    continuum_datas.append(continuum_data)
+
+
+def plot_sum_patches(spaxel, wavelength):
+    for i in cont_images:
+
+        plt.plot(fit['x'], fit['model'])
+        print(fit['amp'], fit['mu'], fit['sigma'], fit['mean'])
