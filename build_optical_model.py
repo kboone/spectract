@@ -221,29 +221,35 @@ for cont_image in cont_images:
     print("Next cont image")
     fit_wave = []
 
-    fit_mus = []
-    fit_sigmas = []
-    fit_amps = []
-    fit_means = []
+    fit_offsets = []
+    fit_widths = []
+    fit_amplitudes = []
+    fit_amplitude_slopes = []
+    fit_backgrounds = []
 
     fit_spaxel_xs = []
     fit_spaxel_ys = []
     fit_spaxel_is = []
     fit_spaxel_js = []
 
+    fit_ccd_x = []
+    fit_ccd_y = []
+
     optical_model = cont_image.optical_model
 
     for spaxel_number in optical_model.spaxel_numbers:
         print(spaxel_number)
-        if spaxel_number > 20:
-            continue
+        # if spaxel_number > 20:
+            # continue
 
         for wavelength in np.arange(3200., 6000., 100.):
-            dx, patch = cont_image.get_sum_patch(spaxel_number, [wavelength],
-                                                 width_x=2.5)
             try:
-                fit = fit_convgauss(dx, patch, 0., 5., 1., 0.8)
+                patch_info = cont_image.fit_smooth_patch(
+                    spaxel_number, wavelength
+                )
             except OpticalModelFitException:
+                # This fit sometimes fails on very low S/N data. Throw out that
+                # patch when it happens.
                 continue
 
             spaxel_i, spaxel_j = \
@@ -252,10 +258,14 @@ for cont_image in cont_images:
                 optical_model.get_spaxel_xy_coordinates(spaxel_number)
 
             fit_wave.append(wavelength)
-            fit_mus.append(fit['mu'])
-            fit_sigmas.append(fit['sigma'])
-            fit_amps.append(fit['amp'])
-            fit_means.append(fit['mean'])
+            fit_offsets.append(patch_info['offset'])
+            fit_widths.append(patch_info['width'])
+            fit_amplitudes.append(patch_info['amplitude'])
+            fit_amplitude_slopes.append(patch_info['amplitude_slope'])
+            fit_backgrounds.append(patch_info['background'])
+
+            fit_ccd_x.append(patch_info['ccd_x'])
+            fit_ccd_y.append(patch_info['ccd_y'])
 
             fit_spaxel_xs.append(spaxel_x)
             fit_spaxel_ys.append(spaxel_y)
@@ -264,10 +274,15 @@ for cont_image in cont_images:
 
     continuum_data = Table({
         'wavelength': fit_wave,
-        'offset': fit_mus,
-        'width': fit_sigmas,
-        'amplitude': fit_amps,
-        'background': fit_means,
+        'offset': fit_offsets,
+        'width': fit_widths,
+        'amplitude': fit_amplitudes,
+        'amplitude_slope': fit_amplitude_slopes,
+        'background': fit_backgrounds,
+
+        'ccd_x': fit_ccd_x,
+        'ccd_y': fit_ccd_y,
+
         'spaxel_x': fit_spaxel_xs,
         'spaxel_y': fit_spaxel_ys,
         'spaxel_i': fit_spaxel_is,
@@ -275,10 +290,3 @@ for cont_image in cont_images:
     })
 
     continuum_datas.append(continuum_data)
-
-
-def plot_sum_patches(spaxel, wavelength):
-    for i in cont_images:
-
-        plt.plot(fit['x'], fit['model'])
-        print(fit['amp'], fit['mu'], fit['sigma'], fit['mean'])

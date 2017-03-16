@@ -158,7 +158,7 @@ class IfuCcdImage():
         spaxel_i_single, spaxel_j_single = \
             self.optical_model.get_all_spaxel_ij_coordinates()
 
-        spaxel_numbers_single = sorted(self.optical_model._spaxels.keys())
+        spaxel_numbers_single = sorted(self.optical_model.spaxels.keys())
 
         spaxel_i = np.repeat(spaxel_i_single, len(arc_wavelength))
         spaxel_j = np.repeat(spaxel_j_single, len(arc_wavelength))
@@ -399,6 +399,129 @@ class IfuCcdImage():
         sum_patch = np.sum(patch, axis=0)
 
         return dx_vals, sum_patch
+
+    def fit_smooth_patch(self, spaxel_number, wavelength, width_x=2.5,
+                         width_y=10):
+        """Fit for the position and width of data in a given patch around a
+        smooth region of the spectrum.
+
+        We make the following assumptions:
+        - The spectrum varies smoothly and can be reasonably represented within
+        the patch by f(y) = f_0 + f_1 * (y-y_0).
+        - The spectrum's x position can be represented by a linear offset
+        within the patch, i.e.: x(y) = x_0 + x_1 * (y-y_0).
+        - The spectrum's width is constant over the patch.
+        - The background is constant within the patch.
+
+        On a continuum image with a maximum difference in the y direction of
+        roughly 20 pixels these assumptions hold to one part in a thousand. Be
+        careful with other situations!
+
+        Returns a dictionary with the following keys:
+            offset: the x offset of the patch
+            width: the width of the PSF at the patch (The width is the width of
+                a gaussian convolved with a pixel)
+            amplitude: the amplitude of the data in the patch.
+            amplitude_slope: the slope of the amplitude in units/pixel.
+            background: the background around the gaussian
+        """
+        if width_y > 20:
+            print("WARNING: fit_smooth_patch makes approximations that aren't"
+                  " valid on large patches! You requested a window of %f"
+                  " pixels which is probably too big. See the doctring for"
+                  " details" % width_y)
+
+        dx_vals, dy_vals, patch = self.get_patch(
+            spaxel_number, [wavelength], width_x=width_x, width_y=width_y
+        )
+
+        # Figure out the conversion between model y coordinate to model x
+        # coordinate. For a window where the amplitude slope approximation is
+        # appropriate, we can get away with just a linear relation to within a
+        # couple thousandths of a pixel.
+        ref_x, ref_y = self.get_ccd_coordinates(
+            spaxel_number, [wavelength, wavelength+10]
+        )
+        center_x = ref_x[0]
+        center_y = ref_y[0]
+
+        model_slope = (ref_x[1] - ref_x[0]) / (ref_y[1] - ref_y[0])
+        model_dx = dy_vals * model_slope
+
+        mesh_dx, mesh_dy = np.meshgrid(dx_vals, dy_vals)
+        mesh_dx, mesh_model_dx = np.meshgrid(dx_vals, model_dx)
+
+        fit_x = mesh_dx - mesh_model_dx
+        fit_y = mesh_dy
+
+        def model(amp, amp_slope, mu, sigma, mean):
+            fit_amp = amp + fit_y * amp_slope
+            model = convgauss(fit_x, fit_amp, mu, sigma) + mean
+
+            return model
+
+        def fit_func(params):
+            return np.sum((patch - model(*params))**2)
+
+        start_amp = np.median(np.sum(patch, axis=1))
+
+        start_params = np.array([start_amp, 0., 0., 1., 0.])
+        bounds = [
+            (0.1*start_amp, 10*start_amp),
+            (None, None),
+            (-10., 10.),
+            (0.2, 3.),
+            (None, None),
+        ]
+
+        res = minimize(
+            fit_func,
+            start_params,
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+
+        if not res.success:
+            raise OpticalModelFitException(res.message)
+
+        fit_params = res.x
+
+        fit_amp, fit_amp_slope, fit_mu, fit_sigma, fit_mean = fit_params
+        result_model = model(*fit_params)
+
+        no_mean_fit_params = fit_params.copy()
+        no_mean_fit_params[-1] = 0.
+        result_model_no_mean = model(*no_mean_fit_params)
+
+        do_print = False
+
+        if fit_amp < 0.2*start_amp or fit_amp > 2.0*start_amp:
+            print("WARNING: Fit amplitude out of normal bounds:")
+            do_print = True
+
+        if do_print:
+            print("Fit results:")
+            print("    Amplitude: %8.2f (start: %8.2f)" % (fit_amp, start_amp))
+            print("    Center:    %8.2f (start: %8.2f)" % (fit_mu, 0.))
+            print("    Sigma:     %8.2f (start: %8.2f)" % (fit_sigma, 1.))
+            print("    Mean:      %8.2f (start: %8.2f)" % (fit_mean, 0.))
+
+        return {
+            'amplitude': fit_amp,
+            'amplitude_slope': fit_amp_slope,
+            'offset': fit_mu,
+            'width': fit_sigma,
+            'background': fit_mean,
+
+            'model': result_model,
+            'model_no_mean': result_model_no_mean,
+            'fit_x': fit_x,
+            'fit_y': fit_y,
+            'fit_result': res,
+
+            'ccd_x': center_x,
+            'ccd_y': center_y,
+        }
 
 
 class SpaxelModelFitter():
@@ -920,11 +1043,11 @@ class OpticalModel():
         model_data is a dictionary-like iterable with spaxel number as the key
         and the parameters for a SpaxelModel as the values.
         """
-        self._spaxels = {}
+        self.spaxels = {}
 
         for spaxel_number, spaxel_data in model_data.items():
             spaxel = SpaxelModel(**spaxel_data)
-            self._spaxels[spaxel_number] = spaxel
+            self.spaxels[spaxel_number] = spaxel
 
     @property
     def spaxel_numbers(self):
@@ -932,7 +1055,7 @@ class OpticalModel():
 
         The array will be sorted.
         """
-        return sorted(self._spaxels.keys())
+        return sorted(self.spaxels.keys())
 
     def get_all_spaxel_ij_coordinates(self):
         """Return the spaxel i,j coordinates of every spaxel
@@ -943,7 +1066,7 @@ class OpticalModel():
         all_spaxel_j = []
 
         for spaxel_number in self.spaxel_numbers:
-            spaxel = self._spaxels[spaxel_number]
+            spaxel = self.spaxels[spaxel_number]
             spaxel_i, spaxel_j = spaxel.ij_coordinates
             all_spaxel_i.append(spaxel_i)
             all_spaxel_j.append(spaxel_j)
@@ -955,7 +1078,7 @@ class OpticalModel():
 
     def get_spaxel_ij_coordinates(self, spaxel_number):
         """Return the spaxel i,j coordinates of a given spaxel"""
-        return self._spaxels[spaxel_number].ij_coordinates
+        return self.spaxels[spaxel_number].ij_coordinates
 
     def get_all_spaxel_xy_coordinates(self):
         """Return the spaxel x,y coordinates of every spaxel
@@ -966,7 +1089,7 @@ class OpticalModel():
         all_spaxel_y = []
 
         for spaxel_number in self.spaxel_numbers:
-            spaxel = self._spaxels[spaxel_number]
+            spaxel = self.spaxels[spaxel_number]
             spaxel_x, spaxel_y = spaxel.xy_coordinates
             all_spaxel_x.append(spaxel_x)
             all_spaxel_y.append(spaxel_y)
@@ -978,7 +1101,7 @@ class OpticalModel():
 
     def get_spaxel_xy_coordinates(self, spaxel_number):
         """Return the spaxel x,y coordinates of a given spaxel"""
-        return self._spaxels[spaxel_number].xy_coordinates
+        return self.spaxels[spaxel_number].xy_coordinates
 
     def get_all_ccd_coordinates(self, wavelength):
         """Return the CCD coordinates of every spaxel at the given wavelength
@@ -986,13 +1109,13 @@ class OpticalModel():
         The coordinates will be sorted by the spaxel number to ensure a
         consistent order.
         """
-        ordered_spaxel_numbers = sorted(self._spaxels.keys())
+        ordered_spaxel_numbers = sorted(self.spaxels.keys())
 
         all_x = []
         all_y = []
 
         for spaxel_number in ordered_spaxel_numbers:
-            spaxel = self._spaxels[spaxel_number]
+            spaxel = self.spaxels[spaxel_number]
             x_coord, y_coord = spaxel.get_ccd_coordinates(wavelength)
             all_x.append(x_coord)
             all_y.append(y_coord)
@@ -1004,7 +1127,7 @@ class OpticalModel():
 
     def get_ccd_coordinates(self, spaxel_number, wavelength):
         """Return the CCD coordinates of a spaxel at the given wavelength"""
-        return self._spaxels[spaxel_number].get_ccd_coordinates(wavelength)
+        return self.spaxels[spaxel_number].get_ccd_coordinates(wavelength)
 
     def scatter_ccd_coordinates(self, wavelength, *args, **kwargs):
         """Make a scatter plot of the CCD positions of all of the spaxels at a
@@ -1023,7 +1146,7 @@ class OpticalModel():
         wavelength array)
         """
         for spaxel_number, iter_new_spaxel_data in new_spaxel_data.items():
-            spaxel = self._spaxels[spaxel_number]
+            spaxel = self.spaxels[spaxel_number]
             spaxel.update(**iter_new_spaxel_data)
 
 
@@ -1042,6 +1165,7 @@ def convgauss(x, amp, mu, sigma):
         )
     )
 
+
 def convgauss_gradient(x, amp, mu, sigma, gradient_index):
     """Evaluate the gradient of a 1d gaussian convolved with a pixel.
 
@@ -1059,7 +1183,7 @@ def convgauss_gradient(x, amp, mu, sigma, gradient_index):
         # error function. I worked these out analytically.
         return (
             amp * 0.5 * (-1. / (np.sqrt(2) * sigma)) * 2 / np.sqrt(np.pi) * (
-                np.exp(-((x + 0.5 - mu) / (np.sqrt(2) * sigma))**2) - 
+                np.exp(-((x + 0.5 - mu) / (np.sqrt(2) * sigma))**2) -
                 np.exp(-((x - 0.5 - mu) / (np.sqrt(2) * sigma))**2)
             )
         )
@@ -1080,8 +1204,6 @@ def convgauss_gradient(x, amp, mu, sigma, gradient_index):
     # Shouldn't make it here... invalid index
     raise OpticalModelFitException("Invalid gradient index %d!" %
                                    gradient_index)
-
-
 
 
 def multigauss(amp1, mu1, sigma1, amp2, mu2, sigma2):
@@ -1114,6 +1236,102 @@ def convgauss_2d(mesh_x, mesh_y, amp, mu_x, mu_y, sigma_x, sigma_y):
 
 def fit_convgauss(x, y, start_mu, search_mu, start_sigma, search_sigma):
     """Fit a 1D gaussian convolved with a pixel to data"""
+    fit_min_mu = start_mu - search_mu
+    fit_max_mu = start_mu + search_mu
+    fit_min_sigma = start_sigma - search_sigma
+    fit_max_sigma = start_sigma + search_sigma
+
+    def model(amp, mu, sigma, mean):
+        model = convgauss(x, amp, mu, sigma) + mean
+
+        return model
+
+    def fit_func(params):
+        return np.sum((y - model(*params))**2)
+
+    def model_gradient(amp, mu, sigma, mean, gradient_index):
+        # This gradient is pretty slow right now. I should probably optimize it
+        # or do it in cython or something.
+        if gradient_index == 3:
+            # mean
+            return np.ones(len(x))
+        else:
+            return convgauss_gradient(x, amp, mu, sigma, gradient_index)
+
+    def fit_func_gradient(params):
+        fit_model = model(*params)
+
+        gradient = []
+        for i in range(len(params)):
+            gradient.append(
+                np.sum(-2. * (y - fit_model) * model_gradient(*params, i))
+            )
+
+        gradient = np.array(gradient)
+
+        return gradient
+
+    start_amp = np.sum(y)
+
+    start_params = np.array([start_amp, start_mu, start_sigma, 0.])
+    bounds = [
+        (0.1*start_amp, 10*start_amp),
+        (fit_min_mu, fit_max_mu),
+        (fit_min_sigma, fit_max_sigma),
+        (None, None),
+    ]
+
+    res = minimize(
+        fit_func,
+        start_params,
+        jac=fit_func_gradient,
+        method='L-BFGS-B',
+        bounds=bounds
+    )
+
+    if not res.success:
+        raise OpticalModelFitException(res.message)
+
+    fit_params = res.x
+
+    fit_amp, fit_mu, fit_sigma, fit_mean = fit_params
+    result_model = model(*fit_params)
+
+    no_mean_fit_params = fit_params.copy()
+    no_mean_fit_params[-1] = 0.
+    result_model_no_mean = model(*no_mean_fit_params)
+
+    do_print = False
+
+    if fit_amp < 0.5*start_amp or fit_amp > 1.5*start_amp:
+        print("WARNING: Fit amplitude out of normal bounds:")
+        do_print = True
+
+    if do_print:
+        print("Fit results:")
+        print("    Amplitude: %8.2f (start: %8.2f)" % (fit_amp, start_amp))
+        print("    Center:    %8.2f (start: %8.2f)" % (fit_mu, start_mu))
+        print("    Sigma:     %8.2f (start: %8.2f)" % (fit_sigma, start_sigma))
+        print("    Mean:      %8.2f (start: %8.2f)" % (fit_mean, 0.))
+        print("    Residual power fraction: %8.2f" %
+              (np.sum((y - result_model)**2) / np.sum(y**2)))
+
+    return {
+        'amp': fit_amp,
+        'mu': fit_mu,
+        'sigma': fit_sigma,
+        'mean': fit_mean,
+        'model': result_model,
+        'model_no_mean': result_model_no_mean,
+        'x': x,
+        'y': y,
+        'fit_result': res,
+    }
+
+def fit_convgauss_patch(data, x, y, model_y):
+    """Fit a 1D gaussian convolved with a pixel to a patch of data where the
+    center varies in the y direction.
+    """
     fit_min_mu = start_mu - search_mu
     fit_max_mu = start_mu + search_mu
     fit_min_sigma = start_sigma - search_sigma
