@@ -401,7 +401,7 @@ class IfuCcdImage():
         return dx_vals, sum_patch
 
     def fit_smooth_patch(self, spaxel_number, wavelength, width_x=2.5,
-                         width_y=10):
+                         width_y=10, fit_background=False, psf_func=None):
         """Fit for the position and width of data in a given patch around a
         smooth region of the spectrum.
 
@@ -431,6 +431,9 @@ class IfuCcdImage():
                   " pixels which is probably too big. See the doctring for"
                   " details" % width_y)
 
+        if psf_func is None:
+            psf_func = convgauss
+
         dx_vals, dy_vals, patch = self.get_patch(
             spaxel_number, [wavelength], width_x=width_x, width_y=width_y
         )
@@ -454,9 +457,9 @@ class IfuCcdImage():
         fit_x = mesh_dx - mesh_model_dx
         fit_y = mesh_dy
 
-        def model(amp, amp_slope, mu, sigma, mean):
+        def model(amp, amp_slope, mu, sigma, background=0):
             fit_amp = amp + fit_y * amp_slope
-            model = convgauss(fit_x, fit_amp, mu, sigma) + mean
+            model = psf_func(fit_x, fit_amp, mu, sigma) + background
 
             return model
 
@@ -465,14 +468,19 @@ class IfuCcdImage():
 
         start_amp = np.median(np.sum(patch, axis=1))
 
-        start_params = np.array([start_amp, 0., 0., 1., 0.])
+        start_params = [start_amp, 0., 0., 1.]
         bounds = [
             (0.1*start_amp, 10*start_amp),
             (None, None),
             (-10., 10.),
             (0.2, 3.),
-            (None, None),
         ]
+
+        if fit_background:
+            start_params.append(0.)
+            bounds.append((None, None))
+
+        start_params = np.array(start_params)
 
         res = minimize(
             fit_func,
@@ -486,12 +494,19 @@ class IfuCcdImage():
 
         fit_params = res.x
 
-        fit_amp, fit_amp_slope, fit_mu, fit_sigma, fit_mean = fit_params
-        result_model = model(*fit_params)
+        # fit_amp, fit_amp_slope, fit_mu, fit_sigma, fit_mean = fit_params
+        # result_model = model(*fit_params)
 
-        no_mean_fit_params = fit_params.copy()
-        no_mean_fit_params[-1] = 0.
-        result_model_no_mean = model(*no_mean_fit_params)
+        # no_mean_fit_params = fit_params.copy()
+        # no_mean_fit_params[-1] = 0.
+        # result_model_no_mean = model(*no_mean_fit_params)
+
+        if fit_background:
+            fit_amp, fit_amp_slope, fit_mu, fit_sigma, background = fit_params
+        else:
+            fit_amp, fit_amp_slope, fit_mu, fit_sigma = fit_params
+
+        result_model = model(*fit_params)
 
         do_print = False
 
@@ -501,20 +516,22 @@ class IfuCcdImage():
 
         if do_print:
             print("Fit results:")
-            print("    Amplitude: %8.2f (start: %8.2f)" % (fit_amp, start_amp))
-            print("    Center:    %8.2f (start: %8.2f)" % (fit_mu, 0.))
-            print("    Sigma:     %8.2f (start: %8.2f)" % (fit_sigma, 1.))
-            print("    Mean:      %8.2f (start: %8.2f)" % (fit_mean, 0.))
+            print("    Amplitude:  %8.2f (start: %8.2f)" %
+                  (fit_amp, start_amp))
+            print("    Center:     %8.2f (start: %8.2f)" % (fit_mu, 0.))
+            print("    Sigma:      %8.2f (start: %8.2f)" % (fit_sigma, 1.))
+            if fit_background:
+                print("    Background: %8.2f (start: %8.2f)" %
+                      (background, 0.))
 
-        return {
+        result = {
             'amplitude': fit_amp,
             'amplitude_slope': fit_amp_slope,
             'offset': fit_mu,
             'width': fit_sigma,
-            'background': fit_mean,
 
+            'patch': patch,
             'model': result_model,
-            'model_no_mean': result_model_no_mean,
             'fit_x': fit_x,
             'fit_y': fit_y,
             'fit_result': res,
@@ -522,6 +539,11 @@ class IfuCcdImage():
             'ccd_x': center_x,
             'ccd_y': center_y,
         }
+
+        if fit_background:
+            result['background'] = background
+
+        return result
 
 
 class SpaxelModelFitter():
