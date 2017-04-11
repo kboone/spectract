@@ -1,9 +1,14 @@
 import numpy as np
 from matplotlib import pyplot as plt
 from astropy.table import Table
+import tqdm
+
+from scipy.interpolate import splantider, splev, InterpolatedUnivariateSpline
+from scipy.optimize import minimize
 
 from optical_model import OpticalModel, OpticalModelTransformation, \
-    IfuCcdImage, OpticalModelException, OpticalModelFitException
+    IfuCcdImage, OpticalModelException, OpticalModelFitException, \
+    SpaxelModelFitter, nmad
 
 plt.ion()
 
@@ -20,7 +25,12 @@ paths = [
     ('./data/P09_184_174_010_07_B.fits', './data/P09_184_172_011_03_B.fits'),
     ('./data/P10_172_091_010_07_B.fits', './data/P10_172_091_011_03_B.fits'),
     ('./data/P11_267_082_002_07_B.fits', './data/P11_267_082_003_03_B.fits'),
-    ('./data/P13_129_092_010_07_B.fits', './data/P13_129_092_011_03_B.fits'),
+
+    # This one has some alignment issues between the arc and the data.
+    # Not sure how representative it is.
+    # ('./data/P13_129_092_010_07_B.fits', './data/P13_129_092_011_03_B.fits'),
+
+    # Real data test. This image has the U patch in es2
     # ('./data/P08_231_069_003_17_B.fits', './data/P08_231_069_004_03_B.fits'),
 
     # Don't use:
@@ -30,7 +40,9 @@ paths = [
 
 ref_idx = 2
 
-psf_ref_wave = 4700.
+print("TODO: go back to more wavelengths")
+# psf_ref_waves = [4100., 4400., 4700.]
+psf_ref_waves = [4700.]
 
 ###############################################################################
 # CONFIG
@@ -118,7 +130,10 @@ def load_images(optical_model, paths, ref_idx):
             print("Aligning %s to %s" % (arc_path, ref_arc_path))
 
             arc_image = IfuCcdImage(arc_path, optical_model)
-            arc_image.align_to_arc_image(ref_arc_image)
+            arc_image.align_to_arc_image(
+                ref_arc_image,
+                # verbose=True
+            )
 
             cont_image = arc_image.load_image_with_transformation(cont_path)
 
@@ -143,7 +158,8 @@ def load_images(optical_model, paths, ref_idx):
     return arc_images, cont_images, all_arc_data
 
 
-def generate_optical_model_from_arcs(optical_model, arc_data):
+def generate_optical_model_from_arcs(optical_model, arc_data,
+                                     optical_model_wavelength):
     """Use arc data to generate an optical model coordinate model
 
     This model will not be perfect as it has to interpolate between arc lines,
@@ -160,12 +176,11 @@ def generate_optical_model_from_arcs(optical_model, arc_data):
         all_arc_data['spaxel_y'],
         all_arc_data['wavelength'],
         order=5,
-        verbose=True
+        # verbose=True,
+        initial_clip=False,
     )
 
     print("Applying initial optical model update from arcs")
-    optical_model_wavelength = np.arange(2500, 6000, 20.)
-
     new_spaxel_data = {}
 
     for spaxel_number in optical_model.spaxel_numbers:
@@ -239,66 +254,243 @@ def plot_initial_model_test(transformation, spaxel_i, spaxel_j, mode=0,
     plt.legend()
 
 
-def build_core_psf(cont_image, wave):
+def fit_continuum_image(cont_image, wave, **kwargs):
+    """Fit a continuum image at a given wavelength"""
+    print("Fitting continuum image %s" % cont_image)
+
+    all_infos = []
+
+    optical_model = cont_image.optical_model
+
+    for iter_wave in tqdm.tqdm(np.atleast_1d(wave)):
+        for spaxel_number in optical_model.spaxel_numbers:
+            # if spaxel_number not in [12, 80, 150, 220]:
+                # continue
+            try:
+                patch_info = cont_image.fit_smooth_patch(
+                    spaxel_number, iter_wave, **kwargs
+                )
+            except OpticalModelFitException:
+                # This fit sometimes fails on very low S/N data. Throw out that
+                # patch when it happens.
+                continue
+
+            spaxel_x, spaxel_y = \
+                optical_model.get_spaxel_xy_coordinates(spaxel_number)
+
+            patch_info['spaxel_x'] = spaxel_x
+            patch_info['spaxel_y'] = spaxel_y
+
+            all_infos.append(patch_info)
+
+    result = Table(all_infos)
+
+    return result
+
+
+def fit_continuum_spaxel_offsets(continuum_data):
+    """fit for the offsets from several continuum images"""
+    spaxel_numbers = np.unique(continuum_data['spaxel_number'])
+
+    for spaxel_number in spaxel_numbers:
+        spaxel_data = continuum_data[continuum_data['spaxel_number'] ==
+                                     spaxel_number]
+        wave_offsets = []
+
+        wavelengths = np.unique(spaxel_data['wavelength'])
+
+        for wavelength in wavelengths:
+            wave_data = spaxel_data[spaxel_data['wavelength'] == wavelength]
+
+            wave_offset = np.median(wave_data['offset'])
+            wave_offsets.append(wave_offset)
+
+
+def build_core_psf(cont_image, wavelengths):
     """Build a core psf from a continuum image at a reference wavelength"""
-    print("Building core PSF model")
+    print("Building core PSF model from %s" % cont_image)
     psf_fit_x = []
     psf_fit_y = []
     psf_fit_widths = []
 
+    print("  Fitting %d patches" % (
+        len(optical_model.spaxel_numbers) * len(np.atleast_1d(wavelengths))
+    ))
+
     for spaxel_number in optical_model.spaxel_numbers:
-        try:
-            patch_info = cont_image.fit_smooth_patch(
-                spaxel_number, psf_ref_wave, 3.
-            )
-        except OpticalModelFitException:
-            # This fit sometimes fails on very low S/N data. Throw out that
-            # patch when it happens.
-            continue
+        for wave in np.atleast_1d(wavelengths):
+            try:
+                patch_info = cont_image.fit_smooth_patch(
+                    spaxel_number, wave, 3.
+                )
+            except OpticalModelFitException:
+                # This fit sometimes fails on very low S/N data. Throw out that
+                # patch when it happens.
+                continue
 
-        fit_x = (patch_info['fit_x'] - patch_info['offset']).flat
-        fit_amp = (patch_info['amplitude'] +
-                   patch_info['fit_y'] * patch_info['amplitude_slope'])
-        fit_y = ((patch_info['patch']) / fit_amp).flat
-        fit_width = np.ones(len(fit_x)) * patch_info['width']
+            fit_x = (patch_info['fit_x'] - patch_info['offset']).flat
+            fit_amp = (patch_info['amplitude'] +
+                       patch_info['fit_y'] * patch_info['amplitude_slope'])
+            fit_y = ((patch_info['patch']) / fit_amp).flat
+            fit_width = np.ones(len(fit_x)) * patch_info['width']
 
-        psf_fit_x.extend(fit_x)
-        psf_fit_y.extend(fit_y)
-        psf_fit_widths.extend(fit_width)
+            psf_fit_x.extend(fit_x)
+            psf_fit_y.extend(fit_y)
+            psf_fit_widths.extend(fit_width)
 
     psf_fit_x = np.array(psf_fit_x)
     psf_fit_y = np.array(psf_fit_y)
     psf_fit_widths = np.array(psf_fit_widths)
 
-    scale_x = psf_fit_x / psf_fit_widths
-    scale_y = psf_fit_y * psf_fit_widths
-    scale_order = np.argsort(scale_x)
+    print("  Fitting core PSF spline to %d pixels." % len(psf_fit_x))
 
-    order_scale_x = scale_x[scale_order]
-    order_scale_y = scale_y[scale_order]
+    n = 20
+    k = 3
+    t = np.linspace(-6, 6, n+k+1)
+    c_scale = 1000.
+    start_c = np.ones(n) * 0.1 * c_scale
 
-    from scipy.interpolate import LSQUnivariateSpline
-    knot_edge = np.max(np.abs(order_scale_x))
-    knots = np.linspace(-knot_edge, knot_edge, 15)
-    spl = LSQUnivariateSpline(order_scale_x, order_scale_y, knots[1:-1],
-                              bbox=[knots[0], knots[-1]], ext=1)
+    def gen_interp_func(c):
+        scale_c = c / c_scale
 
-    # spl_data = spl._eval_args
+        pad_c = np.zeros(len(t))
+        pad_c[:len(c)] = scale_c
 
-    def psf_func(x, amp, mu, sigma):
-        return amp * spl((x - mu) / sigma) / sigma
+        tck = (t, pad_c, k)
+        int_tck = splantider(tck)
+
+        def interp_func(x, amp, mu, sigma, func_limit=1e10):
+            x_max = (x + 0.5 - mu)
+            x_min = (x - 0.5 - mu)
+            x_max[x_max > func_limit] = func_limit
+            x_min[x_min > func_limit] = func_limit
+            x_min[x_min < -func_limit] = -func_limit
+            x_max[x_max < -func_limit] = -func_limit
+
+            right_eval = splev(x_max/sigma, int_tck, ext=3)
+            left_eval = splev(x_min/sigma, int_tck, ext=3)
+            return amp * (right_eval - left_eval)
+
+        return interp_func
+
+    def to_min(c):
+        interp_func = gen_interp_func(c)
+        return np.sum((interp_func(psf_fit_x, 1., 0., psf_fit_widths) -
+                       psf_fit_y)**2)
+
+    res = minimize(to_min, start_c)
+
+    if not res.success:
+        raise OpticalModelFitException(res.message)
+
+    psf_func = gen_interp_func(res.x)
 
     return psf_func
 
 
+def adjust_optical_model_from_continuums(optical_model, cont_images,
+                                         optical_model_wavelength):
+    # New test. Adjust x positions from continuums.
+    cont_datas = []
+
+    fit_wavelength = optical_model_wavelength
+    for i, cont_image in enumerate(cont_images):
+        cont_data = fit_continuum_image(cont_image, fit_wavelength,
+                                        psf_func=psf_func)
+        cont_data['image_index'] = i
+        cont_datas.append(cont_data)
+
+    all_cont_data = np.hstack(cont_datas)
+
+    spaxel_offset_splines = {}
+
+    for spaxel_number in optical_model.spaxel_numbers:
+        spaxel_cut = all_cont_data['spaxel_number'] == spaxel_number
+
+        if np.sum(spaxel_cut) == 0:
+            # Skip spaxels that we don't have data for. This is mainly a
+            # testing thing.
+            continue
+
+        spaxel_data = all_cont_data[spaxel_cut]
+
+        offset_medians = []
+        offset_nmads = []
+
+        for wavelength in fit_wavelength:
+            wave_data = spaxel_data[spaxel_data['wavelength'] == wavelength]
+            offset_median = np.median(wave_data['offset'])
+            offset_nmad = nmad(wave_data['offset'])
+            offset_medians.append(offset_median)
+            offset_nmads.append(offset_nmad)
+
+        offset_spline = InterpolatedUnivariateSpline(fit_wavelength,
+                                                     offset_medians)
+
+        spaxel_offset_splines[spaxel_number] = offset_spline
+
+        optical_model.spaxels[spaxel_number].apply_shift(offset_medians, 0.)
+
+    return cont_datas, spaxel_offset_splines
+
+
+def full_psf(x, amplitude, center, core_psf, core_width, tail_fraction,
+             tail_width, core_range=3):
+    core_psf_vals = core_psf(x, amplitude, center, core_width, core_range)
+
+    tail_psf_x = x - center
+    tail_psf_x_max = tail_psf_x + 0.5
+    tail_psf_x_min = tail_psf_x - 0.5
+    sign = (tail_psf_x > 0) * 2 - 1
+    cut_max = np.abs(tail_psf_x_max) < core_range
+    tail_psf_x_max[cut_max] = core_range * sign[cut_max]
+    cut_min = np.abs(tail_psf_x_min) < core_range
+    tail_psf_x_min[cut_min] = core_range * sign[cut_min]
+
+    def cauchy_cdf(x, gamma):
+        return 1/np.pi * np.arctan(x / tail_width) + 1/2
+
+    tail_scale = amplitude * tail_fraction
+    tail_psf_left = tail_scale * cauchy_cdf(tail_psf_x_min, tail_width)
+    tail_psf_right = tail_scale * cauchy_cdf(tail_psf_x_max, tail_width)
+
+    tail_psf_vals = tail_psf_right - tail_psf_left
+
+    full_psf_vals = core_psf_vals + tail_psf_vals
+
+    return full_psf_vals
+
+
 if __name__ == "__main__":
-    optical_model = load_analytic_optical_model()
+    # optical_model = load_analytic_optical_model()
+    # optical_model = OpticalModel.read('./test.om')
+    # optical_model = OpticalModel.read('./test2.om')
+    # optical_model = OpticalModel.read('./test3.om')
+    # optical_model = OpticalModel.read('./test_continuum_adjusted.om')
+    optical_model = OpticalModel.read('./test_continuum_adjusted_2.om')
 
     arc_images, cont_images, all_arc_data = load_images(
         optical_model, paths, ref_idx
     )
 
-    optical_model_wavelength, transformation = \
-        generate_optical_model_from_arcs(optical_model, all_arc_data)
+    optical_model_wavelength = np.arange(3200, 6000, 20.)
+    # transformation = generate_optical_model_from_arcs(
+        # optical_model, all_arc_data, optical_model_wavelength
+    # )
+    # optical_model.write('./test.om')
 
-    psf_func = build_core_psf(cont_images[ref_idx], psf_ref_wave)
+    core_psf_func = build_core_psf(cont_images[ref_idx], psf_ref_waves)
+
+    # cont_datas, spaxel_offset_splines = adjust_optical_model_from_continuums(
+        # optical_model, cont_images, optical_model_wavelength
+    # )
+    # optical_model.write('./test_continuum_adjusted.om')
+
+    # Test of continuum datas
+    # cont_datas = []
+    # fit_wavelength = np.arange(3200, 6000, 200.)
+    # for i, cont_image in enumerate(cont_images):
+        # cont_data = fit_continuum_image(cont_image, fit_wavelength,
+                                        # psf_func=psf_func)
+        # cont_data['image_index'] = i
+        # cont_datas.append(cont_data)

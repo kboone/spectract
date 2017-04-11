@@ -3,6 +3,7 @@ import numpy as np
 import sep
 from astropy.table import Table, join
 from astropy.io import fits
+import pickle
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.special import erf
@@ -16,6 +17,10 @@ class OpticalModelException(Exception):
 
 
 class OpticalModelFitException(OpticalModelException):
+    pass
+
+
+class OpticalModelBoundsException(OpticalModelException):
     pass
 
 
@@ -35,17 +40,19 @@ def _calculate_transformation_components_3(x, y, z, order):
             component_length = len(parameter)
         except TypeError:
             pass
-    if component_length == -1:
-        raise OpticalModelException(
-            "At least one parameter must be multivalued!"
-        )
 
-    components = [np.ones(component_length)]
+    if component_length == -1:
+        components = [1.]
+    else:
+        components = [np.ones(component_length)]
 
     for iter_order in range(1, order+1):
         for start_y in range(iter_order+1):
             for start_z in range(start_y, iter_order+1):
-                new_component = np.ones(component_length)
+                if component_length == -1:
+                    new_component = 1.
+                else:
+                    new_component = np.ones(component_length)
 
                 for i in range(iter_order):
                     if i < start_y:
@@ -57,7 +64,10 @@ def _calculate_transformation_components_3(x, y, z, order):
 
                 components.append(new_component)
 
-    components = np.vstack(components)
+    if component_length == -1:
+        components = np.array(components)
+    else:
+        components = np.vstack(components)
 
     return components
 
@@ -84,7 +94,12 @@ class IfuCcdImage():
         self.optical_model = optical_model
         self.transformation = transformation
 
+        self.observation_id = self.fits_file[0].header['OBSID']
+
         self.__arc_data = None
+
+    def __str__(self):
+        return "IfuCcdImage(%s)" % self.observation_id
 
     def load_image_with_transformation(self, path):
         """Load an image and transfer the transformation from this image to it.
@@ -141,7 +156,7 @@ class IfuCcdImage():
         background = sep.Background(data, bw=256, bh=256)
 
         sub_data = data - background.back()
-        objects = sep.extract(sub_data, 10.0, minarea=4)
+        objects = sep.extract(sub_data, 10.0, minarea=4, filter_kernel=None)
         ccd_x = objects['x']
         ccd_y = objects['y']
 
@@ -168,15 +183,28 @@ class IfuCcdImage():
 
         # Initial catalog match. I scale the y direction slightly when doing
         # matches because the true arc spacing is much larger in that
-        # direction. This allows for larger offsets without failure.
-        y_scale = 3.
-        kdtree_arc = KDTree(np.vstack([ccd_x, ccd_y / y_scale]).T)
-        dist, matches = kdtree_arc.query(
-            np.vstack([model_x, model_y / y_scale]).T
-        )
+        # direction. This allows for larger offsets without failure. We run
+        # this twice, applying a median X and Y shift after the first pass.
+        # This helps with misidentification of lines with close neighbors.
+        offset_x = 0.
+        offset_y = 0.
+        zz = []
+        for i in range(2):
+            y_scale = 3.
+            kdtree_arc = KDTree(
+                np.vstack([ccd_x - offset_x, (ccd_y - offset_y) / y_scale]).T
+            )
+            dist, matches = kdtree_arc.query(
+                np.vstack([model_x, model_y / y_scale]).T
+            )
 
-        match_ccd_x = ccd_x[matches]
-        match_ccd_y = ccd_y[matches]
+            match_ccd_x = ccd_x[matches]
+            match_ccd_y = ccd_y[matches]
+
+            offset_x = np.median(match_ccd_x - model_x)
+            offset_y = np.median(match_ccd_y - model_y)
+
+            zz.append(matches)
 
         result = Table({
             'wavelength': model_lambda,
@@ -201,9 +229,9 @@ class IfuCcdImage():
         if self.__arc_data is None:
             print("TODO: put the arc lines in a proper place!")
             arc_wavelength = [
-                # 3252.52392578,
+                # 3133.167,
                 3261.05493164,          # GOOD
-                # 3341.4839,
+                3341.4839,
                 # 3403.65209961,
                 3466.19995117,          # GOOD
                 # 3467.6550293,
@@ -221,14 +249,23 @@ class IfuCcdImage():
                 # 4678.1489,
                 4799.91210938,          # GOOD
                 5085.82177734,          # GOOD
-                # 5460.75,
+
+                # There is an unidentified line at 5449. Maybe 2nd order light?
+                # Regardless, it throws everything off. Need to be very careful
+                # that the initial model is set reasonably close or the 5460.75
+                # line (which is crucial for alignment) will be lost!
+                # 5449.1001,
+                5460.75,
+
+                5769.598,
+                5790.663,
             ]
 
             self.__arc_data = self.identify_arc_lines(arc_wavelength)
 
         return self.__arc_data
 
-    def align_to_arc_image(self, reference_image):
+    def align_to_arc_image(self, reference_image, verbose=False):
         """Align one arc image to another one."""
 
         ref_arc_data = reference_image.get_arc_data()
@@ -247,7 +284,8 @@ class IfuCcdImage():
             join_arc_data['spaxel_x_1'],
             join_arc_data['spaxel_y_1'],
             join_arc_data['wavelength'],
-            order=3
+            order=3,
+            verbose=verbose,
         )
 
         self.transformation = transformation
@@ -311,6 +349,93 @@ class IfuCcdImage():
             ccd_y = model_y
 
         return ccd_x, ccd_y
+
+    def get_coordinates_for_ccd_y(self, spaxel_number, ccd_y,
+                                  apply_transformation=True, precision=1e-4,
+                                  verbose=False):
+        """Get the wavelength and CCD x coordinate for a given spaxel at a
+        given CCD y position.
+
+        If apply_transformation is True, the image transformation from the
+        model CCD coordinates to image CCD coordinates will be applied.
+
+        This is a bit tricky... the way that we define the image transformation
+        requires the wavelength to calculate the transformation. We iterate to
+        get a reasonable approximation but there will be some error in the
+        final result! precision sets the acceptable level of precision in
+        units of pixels in CCD y.
+        """
+        if verbose:
+            print("Finding coordinates for spaxel #%d at y=%s" %
+                  (spaxel_number, ccd_y))
+
+        max_iterations = 20
+        converged = False
+
+        old_model_x = -1.
+        old_model_y = ccd_y
+        old_wavelength = -1.
+        old_ccd_x = -1.
+        old_ccd_y = -1.
+
+        for iteration in range(max_iterations):
+            new_wavelength, new_model_x = \
+                self.optical_model.get_coordinates_for_ccd_y(
+                    spaxel_number, old_model_y
+                )
+
+            if not apply_transformation or self.transformation is None:
+                # No transformation required, so model_y == ccd_y. We're done!
+                new_ccd_x = new_model_x
+                new_ccd_y = old_model_y
+                converged = True
+                break
+
+            new_ccd_x, new_ccd_y = self.get_ccd_coordinates(
+                spaxel_number, new_wavelength
+            )
+
+            diff = ccd_y - new_ccd_y
+            new_model_y = old_model_y + diff
+
+            max_diff = np.max(np.abs(diff))
+
+            if verbose:
+                print("Iteration %d:" % iteration)
+                if np.shape(ccd_y):
+                    print("  Max deviation: %9.4f" % max_diff)
+                else:
+                    print("  Target CCD y:   %9.4f" % ccd_y)
+                    print("  Current CCD y:  %9.4f (was %9.4f)" %
+                          (new_ccd_y, old_ccd_y))
+                    print("  Current CCD x:  %9.4f (was %9.4f)" %
+                          (new_ccd_x, old_ccd_x))
+                    print("  New wavelength: %9.4f (was %9.4f)" %
+                          (new_wavelength, old_wavelength))
+                    print("  Model y:        %9.4f (was %9.4f)" %
+                          (new_model_y, old_model_y))
+                    print("  Model x:        %9.4f (was %9.4f)" %
+                          (new_model_x, old_model_x))
+
+            if max_diff < precision:
+                converged = True
+                break
+
+            old_model_x = new_model_x
+            old_model_y = new_model_y
+            old_wavelength = new_wavelength
+            old_ccd_x = new_ccd_x
+            old_ccd_y = new_ccd_y
+
+        if not converged:
+            # Shouldn't get here for a reasonable precision level. If this
+            # happens, rerun with verbose=True to see what is happening.
+            raise OpticalModelException(
+                "Unable to determine CCD positions for spaxel #%d at y=%s" %
+                (spaxel_number, ccd_y)
+            )
+
+        return new_wavelength, new_ccd_x
 
     def scatter_ccd_coordinates(self, wavelength, *args,
                                 apply_transformation=True, **kwargs):
@@ -401,7 +526,8 @@ class IfuCcdImage():
         return dx_vals, sum_patch
 
     def fit_smooth_patch(self, spaxel_number, wavelength, width_x=2.5,
-                         width_y=10, fit_background=False, psf_func=None):
+                         width_y=10, fit_background=False, psf_func=None,
+                         verbose_level=1):
         """Fit for the position and width of data in a given patch around a
         smooth region of the spectrum.
 
@@ -417,13 +543,8 @@ class IfuCcdImage():
         roughly 20 pixels these assumptions hold to one part in a thousand. Be
         careful with other situations!
 
-        Returns a dictionary with the following keys:
-            offset: the x offset of the patch
-            width: the width of the PSF at the patch (The width is the width of
-                a gaussian convolved with a pixel)
-            amplitude: the amplitude of the data in the patch.
-            amplitude_slope: the slope of the amplitude in units/pixel.
-            background: the background around the gaussian
+        Returns a dictionary with lots of information about the fit and
+        results.
         """
         if width_y > 20:
             print("WARNING: fit_smooth_patch makes approximations that aren't"
@@ -508,9 +629,10 @@ class IfuCcdImage():
 
         result_model = model(*fit_params)
 
-        do_print = False
+        do_print = verbose_level >= 2
 
-        if fit_amp < 0.2*start_amp or fit_amp > 2.0*start_amp:
+        if (verbose_level == 1 and
+                (fit_amp < 0.2*start_amp or fit_amp > 2.0*start_amp)):
             print("WARNING: Fit amplitude out of normal bounds:")
             do_print = True
 
@@ -536,6 +658,9 @@ class IfuCcdImage():
             'fit_y': fit_y,
             'fit_result': res,
 
+            'spaxel_number': spaxel_number,
+            'wavelength': wavelength,
+
             'ccd_x': center_x,
             'ccd_y': center_y,
         }
@@ -544,6 +669,159 @@ class IfuCcdImage():
             result['background'] = background
 
         return result
+
+    def fit_smooth_patch_2d(self, ccd_x, ccd_y, full_psf, core_psf,
+                            core_psf_range=3, width_x=10, width_y=10,
+                            verbose_level=1):
+        """Fit for the the PSF parameters in a 2d patch on the CCD.
+
+        We make the same assumptions as in fit_smooth_patch. Additionally, we
+        assume that the CCD positions of the spaxels are already determined and
+        we do not fit for them.
+        """
+        if width_y > 20:
+            print("WARNING: fit_smooth_patch_2d makes approximations that "
+                  "aren't valid on large patches! You requested a window of %f"
+                  " pixels which is probably too big. See the doctring for"
+                  " details" % width_y)
+
+        min_x = int(np.around(ccd_x - width_x))
+        max_x = int(np.around(ccd_x + width_x))
+        min_y = int(np.around(ccd_y - width_y))
+        max_y = int(np.around(ccd_y + width_y))
+
+        x_vals = np.arange(min_x, max_x + 1)
+        y_vals = np.arange(min_y, max_y + 1)
+
+        # Find all PSFs in the image
+        # for spaxel_numbers in self.optical_model.spaxel_numbers:
+            # spaxel_wave, spaxel_x = self.get_coordinates_for_ccd_y(
+                # spaxel_number, k
+
+        dx_vals = x_vals - center_x
+        dy_vals = y_vals - center_y
+
+        data = self.fits_file[0].data
+
+        patch = data[min_y:max_y + 1, min_x:max_x + 1]
+
+        return dx_vals, dy_vals, patch
+
+        dx_vals, dy_vals, patch = self.get_patch(
+            spaxel_number, [wavelength], width_x=width_x, width_y=width_y
+        )
+
+        # Figure out the conversion between model y coordinate to model x
+        # coordinate. For a window where the amplitude slope approximation is
+        # appropriate, we can get away with just a linear relation to within a
+        # couple thousandths of a pixel.
+        ref_x, ref_y = self.get_ccd_coordinates(
+            spaxel_number, [wavelength, wavelength+10]
+        )
+        center_x = ref_x[0]
+        center_y = ref_y[0]
+
+        model_slope = (ref_x[1] - ref_x[0]) / (ref_y[1] - ref_y[0])
+        model_dx = dy_vals * model_slope
+
+        mesh_dx, mesh_dy = np.meshgrid(dx_vals, dy_vals)
+        mesh_dx, mesh_model_dx = np.meshgrid(dx_vals, model_dx)
+
+        fit_x = mesh_dx - mesh_model_dx
+        fit_y = mesh_dy
+
+        def model(amp, amp_slope, mu, sigma, background=0):
+            fit_amp = amp + fit_y * amp_slope
+            model = psf_func(fit_x, fit_amp, mu, sigma) + background
+
+            return model
+
+        def fit_func(params):
+            return np.sum((patch - model(*params))**2)
+
+        start_amp = np.median(np.sum(patch, axis=1))
+
+        start_params = [start_amp, 0., 0., 1.]
+        bounds = [
+            (0.1*start_amp, 10*start_amp),
+            (None, None),
+            (-10., 10.),
+            (0.2, 3.),
+        ]
+
+        if fit_background:
+            start_params.append(0.)
+            bounds.append((None, None))
+
+        start_params = np.array(start_params)
+
+        res = minimize(
+            fit_func,
+            start_params,
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+
+        if not res.success:
+            raise OpticalModelFitException(res.message)
+
+        fit_params = res.x
+
+        # fit_amp, fit_amp_slope, fit_mu, fit_sigma, fit_mean = fit_params
+        # result_model = model(*fit_params)
+
+        # no_mean_fit_params = fit_params.copy()
+        # no_mean_fit_params[-1] = 0.
+        # result_model_no_mean = model(*no_mean_fit_params)
+
+        if fit_background:
+            fit_amp, fit_amp_slope, fit_mu, fit_sigma, background = fit_params
+        else:
+            fit_amp, fit_amp_slope, fit_mu, fit_sigma = fit_params
+
+        result_model = model(*fit_params)
+
+        do_print = verbose_level >= 2
+
+        if (verbose_level == 1 and
+                (fit_amp < 0.2*start_amp or fit_amp > 2.0*start_amp)):
+            print("WARNING: Fit amplitude out of normal bounds:")
+            do_print = True
+
+        if do_print:
+            print("Fit results:")
+            print("    Amplitude:  %8.2f (start: %8.2f)" %
+                  (fit_amp, start_amp))
+            print("    Center:     %8.2f (start: %8.2f)" % (fit_mu, 0.))
+            print("    Sigma:      %8.2f (start: %8.2f)" % (fit_sigma, 1.))
+            if fit_background:
+                print("    Background: %8.2f (start: %8.2f)" %
+                      (background, 0.))
+
+        result = {
+            'amplitude': fit_amp,
+            'amplitude_slope': fit_amp_slope,
+            'offset': fit_mu,
+            'width': fit_sigma,
+
+            'patch': patch,
+            'model': result_model,
+            'fit_x': fit_x,
+            'fit_y': fit_y,
+            'fit_result': res,
+
+            'spaxel_number': spaxel_number,
+            'wavelength': wavelength,
+
+            'ccd_x': center_x,
+            'ccd_y': center_y,
+        }
+
+        if fit_background:
+            result['background'] = background
+
+        return result
+
 
 
 class SpaxelModelFitter():
@@ -640,7 +918,7 @@ class SpaxelModelFitter():
         clipping.
         """
         max_iterations = 10
-        initial_clip_sigma = 10.
+        initial_clip_sigma = 20.
         clip_sigma = 5.
 
         self._fit_order = order
@@ -729,16 +1007,16 @@ class OpticalModelTransformation():
         self._parameters = None
         self._scales = None
 
-    def _calculate_transformation(self, params, ref_x, ref_y, ref_z,
+    def _calculate_transformation(self, params, ref_x, ref_y, ref_wavelength,
                                   return_components=False):
         params_x = params[:len(params) // 2]
         params_y = params[len(params) // 2:]
 
         components_x = _calculate_transformation_components_3(
-            ref_x, ref_y, ref_z, self._transformation_order
+            ref_x, ref_y, ref_wavelength, self._transformation_order
         )
         components_y = _calculate_transformation_components_3(
-            ref_x, ref_y, ref_z, self._transformation_order
+            ref_x, ref_y, ref_wavelength, self._transformation_order
         )
 
         offset_x = params_x.dot(components_x)
@@ -751,12 +1029,12 @@ class OpticalModelTransformation():
 
     def _calculate_target(self, params):
         offset_x, offset_y = self._calculate_transformation(
-            params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z
+            params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_wavelength
         )
 
         # Calculate target function
-        diff = ((self._fit_delta_x + offset_x)**2 +
-                (self._fit_delta_y + offset_y)**2)
+        diff = self._fit_weights * ((self._fit_delta_x + offset_x)**2 +
+                                    (self._fit_delta_y + offset_y)**2)
         target = np.sum(diff[self._fit_mask]) / np.sum(self._fit_mask)
 
         return target
@@ -764,11 +1042,12 @@ class OpticalModelTransformation():
     def _calculate_gradient(self, params):
         offset_x, offset_y, components_x, components_y = \
             self._calculate_transformation(
-                params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z, True
+                params, self._fit_ref_x, self._fit_ref_y,
+                self._fit_ref_wavelength, True
             )
 
         # Calculate gradient
-        norm = 2. / np.sum(self._fit_mask)
+        norm = self._fit_weights * 2. / np.sum(self._fit_mask)
         all_deriv_x = norm * components_x * (self._fit_delta_x + offset_x)
         all_deriv_y = norm * components_y * (self._fit_delta_y + offset_y)
         grad_x = np.sum(all_deriv_x[:, self._fit_mask], axis=1)
@@ -780,12 +1059,13 @@ class OpticalModelTransformation():
     def _calculate_hessian(self, params):
         offset_x, offset_y, components_x, components_y = \
             self._calculate_transformation(
-                params, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z, True
+                params, self._fit_ref_x, self._fit_ref_y,
+                self._fit_ref_wavelength, True
             )
 
         # Calculate Hessian
         mask = self._fit_mask
-        norm = 2. / np.sum(mask)
+        norm = self._fit_weights * 2. / np.sum(mask)
         hess_x = norm * components_x[:, mask].dot(components_x[:, mask].T)
         hess_y = norm * components_y[:, mask].dot(components_y[:, mask].T)
         hess = block_diag(hess_x, hess_y)
@@ -805,21 +1085,62 @@ class OpticalModelTransformation():
 
         return scaled_data
 
-    def _calculate_clip(self, data, clip_sigma, min_nmad=1e-8):
+    def _calculate_clip(self, data, wavelengths, clip_sigma, min_nmad=5e-2,
+                        max_nmad=5e-1, verbose=False):
         """Return a mask which clips the data at a given scatter.
 
         We allow for a minimum value on the nmad. This ensures that nothing
         breaks when we compare data to itself.
-        """
-        data_median = np.median(data)
-        data_nmad = nmad(data)
 
-        if data_nmad < min_nmad:
-            data_nmad = min_nmad
+        We do this by group of wavelengths and return the estimated scatter for
+        each one.
+        """
+        data_median = np.zeros(len(data))
+        data_nmad = np.zeros(len(data))
+
+        for wavelength in np.unique(wavelengths):
+            wave_cut = wavelengths == wavelength
+            wave_data = data[wave_cut]
+
+            wave_data_median = np.median(wave_data)
+            wave_data_nmad = nmad(wave_data)
+
+            if wave_data_nmad < min_nmad:
+                wave_data_nmad = min_nmad
+
+            if wave_data_nmad > max_nmad:
+                wave_data_nmad = max_nmad
+
+            data_median[wave_cut] = wave_data_median
+            data_nmad[wave_cut] = wave_data_nmad
+
+            if verbose:
+                print("    Wave: %8.2f, Median: %8.4f, NMAD: %8.4f" %
+                      (wavelength, wave_data_median, wave_data_nmad))
 
         clip = np.abs(data - data_median) < data_nmad * clip_sigma
 
-        return clip
+        return clip, data_nmad
+
+    def _calculate_clip_2d(self, data_x, data_y, wavelengths,
+                           clip_sigma, verbose=False, **kwargs):
+        """Calculate a clip in 2d. See _calculate_clip for details."""
+        if verbose:
+            print("Clip X:")
+        clip_x, nmad_x = self._calculate_clip(
+            data_x, wavelengths, clip_sigma, verbose=verbose, **kwargs
+        )
+
+        if verbose:
+            print("Clip Y:")
+        clip_y, nmad_y = self._calculate_clip(
+            data_y, wavelengths, clip_sigma, verbose=verbose, **kwargs
+        )
+
+        clip = clip_x & clip_y
+
+        return clip, nmad_x, nmad_y
+
 
     def _calculate_num_parameters(self, order):
         """Calculate the number of parameters for a given order of
@@ -830,17 +1151,17 @@ class OpticalModelTransformation():
 
         return total_parameters
 
-    def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y, ref_z,
-            order, verbose=False):
+    def fit(self, target_x, target_y, orig_x, orig_y, ref_x, ref_y,
+            ref_wavelength, order, verbose=False, initial_clip=True):
         """Fit for a transformation between two coordinate sets.
 
         orig_x and orig_y will be transformed to match target_x and target_y.
         The transformation will be done with terms up to second order in each
-        of ref_x, ref_y and ref_z.
+        of ref_x, ref_y and ref_wavelength.
 
-        For my purposes, ref_x, ref_y and ref_z are intended to be the i and j
-        positions of spaxels and the target wavelength. orig/target x and y are
-        intended to be CCD coordinates.
+        For my purposes, ref_x, ref_y and ref_wavelength are intended to be the
+        i and j positions of spaxels and the target wavelength. orig/target x
+        and y are intended to be CCD coordinates.
         """
         max_iterations = 10
         initial_clip_sigma = 10.
@@ -851,9 +1172,10 @@ class OpticalModelTransformation():
 
         scaled_ref_x, *scales_x = self._calculate_scale(ref_x)
         scaled_ref_y, *scales_y = self._calculate_scale(ref_y)
-        scaled_ref_z, *scales_z = self._calculate_scale(ref_z)
+        scaled_ref_wavelength, *scales_wavelength = \
+            self._calculate_scale(ref_wavelength)
 
-        self._scales = [scales_x, scales_y, scales_z]
+        self._scales = [scales_x, scales_y, scales_wavelength]
 
         self._fit_target_x = target_x
         self._fit_target_y = target_y
@@ -861,19 +1183,27 @@ class OpticalModelTransformation():
         self._fit_orig_y = orig_y
         self._fit_ref_x = scaled_ref_x
         self._fit_ref_y = scaled_ref_y
-        self._fit_ref_z = scaled_ref_z
+        self._fit_ref_wavelength = scaled_ref_wavelength
 
         self._fit_delta_x = self._fit_orig_x - self._fit_target_x
         self._fit_delta_y = self._fit_orig_y - self._fit_target_y
 
         # Initial clip
-        clip = (
-            self._calculate_clip(self._fit_delta_x, initial_clip_sigma) &
-            self._calculate_clip(self._fit_delta_y, initial_clip_sigma)
-        )
+        if initial_clip:
+            clip, nmad_x, nmad_y = self._calculate_clip_2d(
+                self._fit_delta_x, self._fit_delta_y, ref_wavelength,
+                initial_clip_sigma, verbose=verbose
+            )
+        else:
+            clip = np.ones(len(self._fit_delta_x), dtype=bool)
+            nmad_x = np.ones(len(self._fit_delta_x))
+            nmad_y = np.ones(len(self._fit_delta_x))
+
         self._fit_mask = clip
         if verbose:
             print("Clipped %d objects in initial clip" % np.sum(~clip))
+
+        self._fit_weights = np.ones(len(self._fit_delta_x))
 
         fit_succeeded = False
 
@@ -891,15 +1221,18 @@ class OpticalModelTransformation():
                 raise OpticalModelFitException(error)
 
             offset_x, offset_y = self._calculate_transformation(
-                res.x, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z
+                res.x, self._fit_ref_x, self._fit_ref_y,
+                self._fit_ref_wavelength
             )
             diff_x = self._fit_delta_x + offset_x
             diff_y = self._fit_delta_y + offset_y
 
-            clip = (
-                self._calculate_clip(diff_x, clip_sigma) &
-                self._calculate_clip(diff_y, clip_sigma)
+            clip, nmad_x, nmad_y = self._calculate_clip_2d(
+                diff_x, diff_y, ref_wavelength, clip_sigma,
+                verbose=verbose
             )
+
+            self._fit_weights = 1 / (nmad_x**2 + nmad_y**2)
 
             new_mask = self._fit_mask & clip
 
@@ -924,7 +1257,8 @@ class OpticalModelTransformation():
 
         self._parameters = res.x
         offset_x, offset_y = self._calculate_transformation(
-            self._parameters, self._fit_ref_x, self._fit_ref_y, self._fit_ref_z
+            self._parameters, self._fit_ref_x, self._fit_ref_y,
+            self._fit_ref_wavelength
         )
 
         trans_x = self._fit_orig_x + offset_x
@@ -932,7 +1266,8 @@ class OpticalModelTransformation():
 
         return (trans_x, trans_y)
 
-    def transform(self, orig_x, orig_y, ref_x, ref_y, ref_z, reverse=False):
+    def transform(self, orig_x, orig_y, ref_x, ref_y, ref_wavelength,
+                  reverse=False):
         """Apply the transformation to a set of x and y coordinates."""
 
         if self._scales is None or self._parameters is None:
@@ -941,13 +1276,14 @@ class OpticalModelTransformation():
             )
 
         # First, rescale our references.
-        scales_x, scales_y, scales_z = self._scales
+        scales_x, scales_y, scales_wavelength = self._scales
         scaled_ref_x = self._apply_scale(ref_x, *scales_x)
         scaled_ref_y = self._apply_scale(ref_y, *scales_y)
-        scaled_ref_z = self._apply_scale(ref_z, *scales_z)
+        scaled_ref_wavelength = self._apply_scale(ref_wavelength,
+                                                  *scales_wavelength)
 
         offset_x, offset_y = self._calculate_transformation(
-            self._parameters, scaled_ref_x, scaled_ref_y, scaled_ref_z
+            self._parameters, scaled_ref_x, scaled_ref_y, scaled_ref_wavelength
         )
 
         if reverse:
@@ -975,7 +1311,7 @@ def ensure_updated(func):
 
 class SpaxelModel():
     def __init__(self, spaxel_number, spaxel_i, spaxel_j, spaxel_x, spaxel_y,
-                 wavelength, ccd_x, ccd_y, width):
+                 wavelength, ccd_x, ccd_y, width, max_y_interpolation=200.):
         self._spaxel_number = spaxel_number
         self._spaxel_i = spaxel_i
         self._spaxel_j = spaxel_j
@@ -994,6 +1330,8 @@ class SpaxelModel():
         self._interp_wave_to_y = None
         self._interp_y_to_wave = None
         self._interp_y_to_x = None
+
+        self._max_y_interpolation = max_y_interpolation
 
     def update(self, spaxel_number=None, spaxel_i=None, spaxel_j=None,
                spaxel_x=None, spaxel_y=None, wavelength=None, ccd_x=None,
@@ -1028,19 +1366,53 @@ class SpaxelModel():
         self._updated = False
 
     def generate_interpolators(self):
-        self._interp_wave_to_x = \
-            InterpolatedUnivariateSpline(self._wavelength, self._ccd_x)
-        self._interp_wave_to_y = \
-            InterpolatedUnivariateSpline(self._wavelength, self._ccd_y)
-        self._interp_y_to_wave = \
-            InterpolatedUnivariateSpline(self._ccd_y, self._wavelength)
-        self._interp_y_to_x = \
-            InterpolatedUnivariateSpline(self._ccd_y, self._ccd_x)
+        self._interp_wave_to_x = InterpolatedUnivariateSpline(
+            self._wavelength, self._ccd_x
+        )
+        self._interp_wave_to_y = InterpolatedUnivariateSpline(
+            self._wavelength, self._ccd_y
+        )
+
+        # Ensure the the y-coordinates are (reverse) ordered. This should
+        # always be the case unless we're overreaching on our interpolation. If
+        # they aren't ordered, the InterpolatedUnivariateSpline does crazy
+        # things.
+        y_order = np.argsort(self._ccd_y)
+        if not np.all(self._ccd_y[y_order] == self._ccd_y[::-1]):
+            raise OpticalModelException(
+                "CCD y coordinates are not ordered for spaxel %d!" %
+                self._spaxel_number
+            )
+
+        self._interp_y_to_wave = InterpolatedUnivariateSpline(
+            self._ccd_y[y_order], self._wavelength[y_order]
+        )
+        self._interp_y_to_x = InterpolatedUnivariateSpline(
+            self._ccd_y[y_order], self._ccd_x[y_order]
+        )
 
     @ensure_updated
     def get_ccd_coordinates(self, wavelength):
         return (self._interp_wave_to_x(wavelength),
                 self._interp_wave_to_y(wavelength))
+
+    @ensure_updated
+    def get_coordinates_for_ccd_y(self, ccd_y):
+        """Returns the wavelength and ccd_x position as a tuple"""
+        # Bounds check
+        min_y = self._ccd_y[-1] - self._max_y_interpolation
+        max_y = self._ccd_y[0] + self._max_y_interpolation
+
+        ccd_y = np.asarray(ccd_y)
+
+        if np.any((ccd_y < min_y) | (ccd_y > max_y)):
+            raise OpticalModelBoundsException(
+                "The model for spaxel %d is only defined for %.1f < y < %.1f" %
+                (self._spaxel_number, min_y, max_y)
+            )
+
+        return (self._interp_y_to_wave(ccd_y),
+                self._interp_y_to_x(ccd_y))
 
     @property
     def ij_coordinates(self):
@@ -1070,6 +1442,19 @@ class OpticalModel():
         for spaxel_number, spaxel_data in model_data.items():
             spaxel = SpaxelModel(**spaxel_data)
             self.spaxels[spaxel_number] = spaxel
+
+    def write(self, path):
+        """Write the optical model to a file"""
+        with open(path, 'wb') as outfile:
+            pickle.dump(self, outfile)
+
+    @classmethod
+    def read(self, path):
+        """Read an optical model from a file"""
+        with open(path, 'rb') as infile:
+            optical_model = pickle.load(infile)
+
+        return optical_model
 
     @property
     def spaxel_numbers(self):
@@ -1150,6 +1535,11 @@ class OpticalModel():
     def get_ccd_coordinates(self, spaxel_number, wavelength):
         """Return the CCD coordinates of a spaxel at the given wavelength"""
         return self.spaxels[spaxel_number].get_ccd_coordinates(wavelength)
+
+    def get_coordinates_for_ccd_y(self, spaxel_number, ccd_y):
+        """Returns the wavelength and ccd_x position of a spaxel at the given
+        ccd_y position."""
+        return self.spaxels[spaxel_number].get_coordinates_for_ccd_y(ccd_y)
 
     def scatter_ccd_coordinates(self, wavelength, *args, **kwargs):
         """Make a scatter plot of the CCD positions of all of the spaxels at a
