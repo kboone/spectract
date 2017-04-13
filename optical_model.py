@@ -671,8 +671,8 @@ class IfuCcdImage():
         return result
 
     def fit_smooth_patch_2d(self, ccd_x, ccd_y, full_psf, core_psf,
-                            core_psf_range=3, width_x=10, width_y=10,
-                            verbose_level=1):
+                            tail_psf_builder, core_psf_range=3, width_x=30,
+                            width_y=10, verbose_level=1):
         """Fit for the the PSF parameters in a 2d patch on the CCD.
 
         We make the same assumptions as in fit_smooth_patch. Additionally, we
@@ -685,101 +685,170 @@ class IfuCcdImage():
                   " pixels which is probably too big. See the doctring for"
                   " details" % width_y)
 
+        # Get the patch
+        data = self.fits_file[0].data
+
         min_x = int(np.around(ccd_x - width_x))
         max_x = int(np.around(ccd_x + width_x))
         min_y = int(np.around(ccd_y - width_y))
         max_y = int(np.around(ccd_y + width_y))
 
+        data_max_y, data_max_x = data.shape
+
+        min_x = np.clip(min_x, 0, data_max_x - 1)
+        max_x = np.clip(max_x, 0, data_max_x - 1)
+        min_y = np.clip(min_y, 0, data_max_y - 1)
+        max_y = np.clip(max_y, 0, data_max_y - 1)
+
         x_vals = np.arange(min_x, max_x + 1)
         y_vals = np.arange(min_y, max_y + 1)
 
-        # Find all PSFs in the image
-        # for spaxel_numbers in self.optical_model.spaxel_numbers:
-            # spaxel_wave, spaxel_x = self.get_coordinates_for_ccd_y(
-                # spaxel_number, k
-
-        dx_vals = x_vals - center_x
-        dy_vals = y_vals - center_y
-
-        data = self.fits_file[0].data
-
         patch = data[min_y:max_y + 1, min_x:max_x + 1]
 
-        return dx_vals, dy_vals, patch
+        patch_dx, patch_dy = np.meshgrid(x_vals - ccd_x, y_vals - ccd_y)
 
-        dx_vals, dy_vals, patch = self.get_patch(
-            spaxel_number, [wavelength], width_x=width_x, width_y=width_y
-        )
+        # Find all spaxels in the patch
+        spaxel_numbers = []
+        spaxel_waves = []
+        spaxel_dxs = []
+        spaxel_start_amps = []
 
-        # Figure out the conversion between model y coordinate to model x
-        # coordinate. For a window where the amplitude slope approximation is
-        # appropriate, we can get away with just a linear relation to within a
-        # couple thousandths of a pixel.
-        ref_x, ref_y = self.get_ccd_coordinates(
-            spaxel_number, [wavelength, wavelength+10]
-        )
-        center_x = ref_x[0]
-        center_y = ref_y[0]
+        num_spaxels = 0
+        for spaxel_number in self.optical_model.spaxel_numbers:
+            try:
+                spaxel_wave, spaxel_x = self.get_coordinates_for_ccd_y(
+                    spaxel_number, y_vals
+                )
+            except OpticalModelBoundsException:
+                continue
 
-        model_slope = (ref_x[1] - ref_x[0]) / (ref_y[1] - ref_y[0])
-        model_dx = dy_vals * model_slope
+            spaxel_dx = np.subtract.outer(x_vals, spaxel_x).T
 
-        mesh_dx, mesh_dy = np.meshgrid(dx_vals, dy_vals)
-        mesh_dx, mesh_model_dx = np.meshgrid(dx_vals, model_dx)
+            if (np.min(spaxel_x) < np.min(x_vals) or np.max(spaxel_x) >
+                    np.max(x_vals)):
+                continue
 
-        fit_x = mesh_dx - mesh_model_dx
-        fit_y = mesh_dy
+            spaxel_idx = np.argmin(np.abs(np.median(spaxel_dx, axis=0)))
+            sum_min_idx = np.clip(spaxel_idx - 2, 0, len(x_vals))
+            sum_max_idx = np.clip(spaxel_idx + 3, 0, len(x_vals))
+            start_amp = np.median(np.sum(patch[:, sum_min_idx:sum_max_idx],
+                                         axis=1))
 
-        def model(amp, amp_slope, mu, sigma, background=0):
-            fit_amp = amp + fit_y * amp_slope
-            model = psf_func(fit_x, fit_amp, mu, sigma) + background
+            spaxel_numbers.append(spaxel_number)
+            spaxel_waves.append(spaxel_wave)
+            spaxel_dxs.append(spaxel_dx)
+            spaxel_start_amps.append(start_amp)
+
+            num_spaxels += 1
+
+        spaxel_numbers = np.array(spaxel_numbers)
+        spaxel_waves = np.array(spaxel_waves)
+        spaxel_dxs = np.array(spaxel_dxs)
+        spaxel_start_amps = np.array(spaxel_start_amps)
+
+        def spaxel_model(index, amplitude, amplitude_slope, offset, core_width,
+                         tail_psf, tail_fraction):
+            fit_amplitude = amplitude + patch_dy * amplitude_slope
+            spaxel_dx = spaxel_dxs[index]
+
+            model = full_psf(spaxel_dx, fit_amplitude, offset, core_psf,
+                             core_width, tail_psf, tail_fraction)
 
             return model
 
+        def patch_model(amplitudes, amplitude_slopes, offsets, core_widths,
+                        tail_fraction, tail_alpha, tail_beta, background):
+            model = np.zeros(patch.shape)
+
+            tail_psf = tail_psf_builder(tail_alpha, tail_beta)
+
+            for i in range(num_spaxels):
+                model += spaxel_model(i, amplitudes[i], amplitude_slopes[i],
+                                      offsets[i], core_widths[i], tail_psf,
+                                      tail_fraction)
+
+            model += background
+
+            return model
+
+        amplitude_scale = 1e4
+        amplitude_slope_scale = 1e2
+        offset_scale = 1e-2
+        background_scale = 1e3
+
+        def parse_parameters(params):
+            amplitudes = params[:num_spaxels] * amplitude_scale
+            amplitude_slopes = (params[num_spaxels:2*num_spaxels] *
+                                amplitude_slope_scale)
+            offsets = params[2*num_spaxels:3*num_spaxels] * offset_scale
+            core_widths = params[3*num_spaxels:4*num_spaxels]
+            tail_fraction, tail_alpha, tail_beta = params[4*num_spaxels:-1]
+            background = params[-1] * background_scale
+
+            return (amplitudes, amplitude_slopes, offsets, core_widths,
+                    tail_fraction, tail_alpha, tail_beta, background)
+
         def fit_func(params):
-            return np.sum((patch - model(*params))**2)
+            model = patch_model(*parse_parameters(params))
+            return np.sum((patch - model)**2)
 
-        start_amp = np.median(np.sum(patch, axis=1))
+        start_params = np.hstack([
+            spaxel_start_amps / amplitude_scale,
+            np.zeros(num_spaxels) / amplitude_slope_scale,
+            np.zeros(num_spaxels) / offset_scale,
+            np.ones(num_spaxels),
+            0.5,
+            2.,
+            2.,
+            np.percentile(patch, 5) / background_scale,
+        ])
 
-        start_params = [start_amp, 0., 0., 1.]
-        bounds = [
-            (0.1*start_amp, 10*start_amp),
-            (None, None),
-            (-10., 10.),
-            (0.2, 3.),
-        ]
+        bounds = []
 
-        if fit_background:
-            start_params.append(0.)
+        # Amplitude bounds
+        for i in range(num_spaxels):
+            bounds.append((0., 10.*spaxel_start_amps[i] / amplitude_scale))
+
+        # Amplitude slope bounds
+        for i in range(num_spaxels):
             bounds.append((None, None))
 
-        start_params = np.array(start_params)
+        # Offset bounds
+        for i in range(num_spaxels):
+            bounds.append((-1. / offset_scale, 1. / offset_scale))
+
+        # Core width bounds
+        for i in range(num_spaxels):
+            bounds.append((0.5, 3.))
+
+        # Tail bounds
+        bounds.append((0., 1.))
+        bounds.append((0.2, 10))
+        bounds.append((0.5, 10))
+
+        # Background bound
+        bounds.append((None, None))
 
         res = minimize(
             fit_func,
             start_params,
             method='L-BFGS-B',
-            bounds=bounds
+            bounds=bounds,
+            options={'maxfun': 100000}
         )
 
         if not res.success:
-            raise OpticalModelFitException(res.message)
+            # raise OpticalModelFitException(res.message)
+            print(OpticalModelFitException(res.message))
 
         fit_params = res.x
+        amplitudes, amplitude_slopes, offsets, core_widths, tail_fraction, \
+            tail_alpha, tail_beta, background = parse_parameters(fit_params)
 
-        # fit_amp, fit_amp_slope, fit_mu, fit_sigma, fit_mean = fit_params
-        # result_model = model(*fit_params)
+        result_model = patch_model(*parse_parameters(fit_params))
 
-        # no_mean_fit_params = fit_params.copy()
-        # no_mean_fit_params[-1] = 0.
-        # result_model_no_mean = model(*no_mean_fit_params)
+        from IPython import embed; embed()
 
-        if fit_background:
-            fit_amp, fit_amp_slope, fit_mu, fit_sigma, background = fit_params
-        else:
-            fit_amp, fit_amp_slope, fit_mu, fit_sigma = fit_params
-
-        result_model = model(*fit_params)
 
         do_print = verbose_level >= 2
 
@@ -1311,7 +1380,7 @@ def ensure_updated(func):
 
 class SpaxelModel():
     def __init__(self, spaxel_number, spaxel_i, spaxel_j, spaxel_x, spaxel_y,
-                 wavelength, ccd_x, ccd_y, width, max_y_interpolation=200.):
+                 wavelength, ccd_x, ccd_y, width):
         self._spaxel_number = spaxel_number
         self._spaxel_i = spaxel_i
         self._spaxel_j = spaxel_j
@@ -1330,8 +1399,6 @@ class SpaxelModel():
         self._interp_wave_to_y = None
         self._interp_y_to_wave = None
         self._interp_y_to_x = None
-
-        self._max_y_interpolation = max_y_interpolation
 
     def update(self, spaxel_number=None, spaxel_i=None, spaxel_j=None,
                spaxel_x=None, spaxel_y=None, wavelength=None, ccd_x=None,
@@ -1397,11 +1464,11 @@ class SpaxelModel():
                 self._interp_wave_to_y(wavelength))
 
     @ensure_updated
-    def get_coordinates_for_ccd_y(self, ccd_y):
+    def get_coordinates_for_ccd_y(self, ccd_y, max_y_interpolation=20):
         """Returns the wavelength and ccd_x position as a tuple"""
         # Bounds check
-        min_y = self._ccd_y[-1] - self._max_y_interpolation
-        max_y = self._ccd_y[0] + self._max_y_interpolation
+        min_y = self._ccd_y[-1] - max_y_interpolation
+        max_y = self._ccd_y[0] + max_y_interpolation
 
         ccd_y = np.asarray(ccd_y)
 

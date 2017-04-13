@@ -5,10 +5,11 @@ import tqdm
 
 from scipy.interpolate import splantider, splev, InterpolatedUnivariateSpline
 from scipy.optimize import minimize
+from scipy.special import gamma
 
 from optical_model import OpticalModel, OpticalModelTransformation, \
     IfuCcdImage, OpticalModelException, OpticalModelFitException, \
-    SpaxelModelFitter, nmad
+    nmad
 
 plt.ion()
 
@@ -389,7 +390,7 @@ def build_core_psf(cont_image, wavelengths):
 
 
 def adjust_optical_model_from_continuums(optical_model, cont_images,
-                                         optical_model_wavelength):
+                                         optical_model_wavelength, psf_func):
     # New test. Adjust x positions from continuums.
     cont_datas = []
 
@@ -434,8 +435,59 @@ def adjust_optical_model_from_continuums(optical_model, cont_images,
     return cont_datas, spaxel_offset_splines
 
 
-def full_psf(x, amplitude, center, core_psf, core_width, tail_fraction,
-             tail_width, core_range=3):
+def moffat_1d(x, alpha, beta):
+    """1d normalized Moffat function.
+
+    Moffat functions typically aren't used in 1D, but if you integrate a 2D
+    Moffat it returns a 1D one (with a different beta). I calculated the
+    normalization in Mathematica.
+    """
+    norm = gamma(beta) / (alpha * np.sqrt(np.pi) * gamma(-0.5 + beta))
+    return norm * (1 + (x / alpha)**2)**-beta
+
+
+def build_tail_psf(alpha, beta):
+    """Generate a Moffat tail PSF function with a given alpha and beta.
+
+    This will return a spline representing a Moffat integrated over a pixel.
+    If you sample this function in unit steps over a wide enough x-range the
+    normalization will give 1 regardless of the offset.
+    """
+    sample_x_min = -20*alpha
+    sample_x_max = 20*alpha
+    step = alpha / 10.
+
+    sample_x = np.arange(sample_x_min, sample_x_max + step, step)
+
+    y_vals = moffat_1d(sample_x, alpha, beta)
+
+    spline = InterpolatedUnivariateSpline(sample_x, y_vals, ext=3)
+    integral_spline = spline.antiderivative()
+
+    def tail_psf(x, amplitude, center, core_range=0.):
+        tail_psf_x = x - center
+        tail_psf_x_max = tail_psf_x + 0.5
+        tail_psf_x_min = tail_psf_x - 0.5
+
+        # Restrict the core
+        sign = (tail_psf_x > 0) * 2 - 1
+        cut_max = np.abs(tail_psf_x_max) < core_range
+        tail_psf_x_max[cut_max] = core_range * sign[cut_max]
+        cut_min = np.abs(tail_psf_x_min) < core_range
+        tail_psf_x_min[cut_min] = core_range * sign[cut_min]
+
+        tail_psf_left = amplitude * integral_spline(tail_psf_x_min)
+        tail_psf_right = amplitude * integral_spline(tail_psf_x_max)
+
+        tail_psf_vals = tail_psf_right - tail_psf_left
+
+        return tail_psf_vals
+
+    return tail_psf
+
+
+def cauchy_full_psf(x, amplitude, center, core_psf, core_width, tail_fraction,
+                    tail_width, core_range=3):
     core_psf_vals = core_psf(x, amplitude, center, core_width, core_range)
 
     tail_psf_x = x - center
@@ -455,6 +507,16 @@ def full_psf(x, amplitude, center, core_psf, core_width, tail_fraction,
     tail_psf_right = tail_scale * cauchy_cdf(tail_psf_x_max, tail_width)
 
     tail_psf_vals = tail_psf_right - tail_psf_left
+
+    full_psf_vals = core_psf_vals + tail_psf_vals
+
+    return full_psf_vals
+
+
+def full_psf(x, amplitude, center, core_psf, core_width, tail_psf,
+             tail_fraction, core_range=3):
+    core_psf_vals = core_psf(x, amplitude, center, core_width, core_range)
+    tail_psf_vals = tail_psf(x, amplitude*tail_fraction, center, core_range)
 
     full_psf_vals = core_psf_vals + tail_psf_vals
 
@@ -482,7 +544,7 @@ if __name__ == "__main__":
     core_psf_func = build_core_psf(cont_images[ref_idx], psf_ref_waves)
 
     # cont_datas, spaxel_offset_splines = adjust_optical_model_from_continuums(
-        # optical_model, cont_images, optical_model_wavelength
+        # optical_model, cont_images, optical_model_wavelength, core_psf_func
     # )
     # optical_model.write('./test_continuum_adjusted.om')
 
@@ -494,3 +556,27 @@ if __name__ == "__main__":
                                         # psf_func=psf_func)
         # cont_data['image_index'] = i
         # cont_datas.append(cont_data)
+
+    # tail_psf_func = build_tail_psf(2., 2.)
+
+
+    print("Test patch fit")
+    coords_x, coords_y = cont_images[0].get_all_ccd_coordinates(4500.)
+    idx = 120
+    # cont_images[0].fit_smooth_patch_2d(885, 1550, full_psf, core_psf_func,
+                                       # build_tail_psf)
+    # cont_images[0].fit_smooth_patch_2d(
+        # coords_x[idx],
+        # coords_y[idx],
+        # full_psf,
+        # core_psf_func,
+        # build_tail_psf
+    # )
+    cont_images[0].fit_smooth_patch_2d(
+        1000.,
+        1550.,
+        full_psf,
+        core_psf_func,
+        build_tail_psf,
+        width_x=50.
+    )
