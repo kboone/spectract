@@ -671,8 +671,8 @@ class IfuCcdImage():
         return result
 
     def fit_smooth_patch_2d(self, ccd_x, ccd_y, full_psf, core_psf,
-                            tail_psf_builder, core_psf_range=3, width_x=30,
-                            width_y=10, verbose_level=1):
+                            core_psf_range=3, width_x=30, width_y=10,
+                            fix_core_widths=None):
         """Fit for the the PSF parameters in a 2d patch on the CCD.
 
         We make the same assumptions as in fit_smooth_patch. Additionally, we
@@ -707,6 +707,8 @@ class IfuCcdImage():
 
         patch_dx, patch_dy = np.meshgrid(x_vals - ccd_x, y_vals - ccd_y)
 
+        fit_mask = np.zeros(patch.shape, dtype=bool)
+
         # Find all spaxels in the patch
         spaxel_numbers = []
         spaxel_waves = []
@@ -739,6 +741,8 @@ class IfuCcdImage():
             spaxel_dxs.append(spaxel_dx)
             spaxel_start_amps.append(start_amp)
 
+            fit_mask[np.abs(spaxel_dx) < 5.] = True
+
             num_spaxels += 1
 
         spaxel_numbers = np.array(spaxel_numbers)
@@ -747,25 +751,29 @@ class IfuCcdImage():
         spaxel_start_amps = np.array(spaxel_start_amps)
 
         def spaxel_model(index, amplitude, amplitude_slope, offset, core_width,
-                         tail_psf, tail_fraction):
+                         tail_fraction_left, tail_index_left,
+                         tail_fraction_right, tail_index_right):
             fit_amplitude = amplitude + patch_dy * amplitude_slope
             spaxel_dx = spaxel_dxs[index]
 
             model = full_psf(spaxel_dx, fit_amplitude, offset, core_psf,
-                             core_width, tail_psf, tail_fraction)
+                             core_width, tail_fraction_left, tail_index_left,
+                             tail_fraction_right, tail_index_right)
 
             return model
 
         def patch_model(amplitudes, amplitude_slopes, offsets, core_widths,
-                        tail_fraction, tail_alpha, tail_beta, background):
+                        tail_fraction_left, tail_index_left,
+                        tail_fraction_right, tail_index_right, background):
             model = np.zeros(patch.shape)
 
-            tail_psf = tail_psf_builder(tail_alpha, tail_beta)
+            # tail_psf = tail_psf_builder(tail_alpha, tail_beta)
 
             for i in range(num_spaxels):
                 model += spaxel_model(i, amplitudes[i], amplitude_slopes[i],
-                                      offsets[i], core_widths[i], tail_psf,
-                                      tail_fraction)
+                                      offsets[i], core_widths[i],
+                                      tail_fraction_left, tail_index_left,
+                                      tail_fraction_right, tail_index_right)
 
             model += background
 
@@ -774,120 +782,137 @@ class IfuCcdImage():
         amplitude_scale = 1e4
         amplitude_slope_scale = 1e2
         offset_scale = 1e-2
-        background_scale = 1e3
+        background_scale = 1e2
+        tail_fraction_scale = 1e-2
 
         def parse_parameters(params):
             amplitudes = params[:num_spaxels] * amplitude_scale
             amplitude_slopes = (params[num_spaxels:2*num_spaxels] *
                                 amplitude_slope_scale)
-            offsets = params[2*num_spaxels:3*num_spaxels] * offset_scale
-            core_widths = params[3*num_spaxels:4*num_spaxels]
-            tail_fraction, tail_alpha, tail_beta = params[4*num_spaxels:-1]
+            # offsets = params[2*num_spaxels:3*num_spaxels] * offset_scale
+            if fix_core_widths is None:
+                core_widths = params[2*num_spaxels:3*num_spaxels]
+            else:
+                core_widths = fix_core_widths
+            # tail_fraction_left, tail_fraction_right = (
+                # params[4*num_spaxels:-1] * tail_fraction_scale
+            # )
+            # tail_fraction_left
+            # tail_fraction_right
             background = params[-1] * background_scale
 
+            offsets = np.zeros(num_spaxels)
+
+            tail_fraction_left = 0.035
+            tail_fraction_right = 0.045
+            tail_index_left = 2.5
+            tail_index_right = 2.5
+
             return (amplitudes, amplitude_slopes, offsets, core_widths,
-                    tail_fraction, tail_alpha, tail_beta, background)
+                    tail_fraction_left, tail_index_left, tail_fraction_right,
+                    tail_index_right, background)
 
         def fit_func(params):
             model = patch_model(*parse_parameters(params))
-            return np.sum((patch - model)**2)
+            return np.sum((patch - model)[fit_mask]**2)
 
-        start_params = np.hstack([
+        start_params = [
             spaxel_start_amps / amplitude_scale,
             np.zeros(num_spaxels) / amplitude_slope_scale,
-            np.zeros(num_spaxels) / offset_scale,
-            np.ones(num_spaxels),
-            0.5,
-            2.,
-            2.,
-            np.percentile(patch, 5) / background_scale,
-        ])
+            # np.zeros(num_spaxels) / offset_scale,
+            # np.ones(num_spaxels),
+            # 0.04 / tail_fraction_scale,
+            # 2.5,
+            # 0.04 / tail_fraction_scale,
+            # 2.5,
+            # np.percentile(patch, 5) / background_scale,
+            # 0. / background_scale,
+        ]
+
+        if fix_core_widths is None:
+            start_params.append(np.ones(num_spaxels))
+
+        start_params.append(np.percentile(patch, 5) / background_scale)
+
+        start_params = np.hstack(start_params)
 
         bounds = []
 
         # Amplitude bounds
         for i in range(num_spaxels):
-            bounds.append((0., 10.*spaxel_start_amps[i] / amplitude_scale))
+            # bounds.append((0., 10.*spaxel_start_amps[i] / amplitude_scale))
+            # bounds.append((0., 10.*spaxel_start_amps[i] / amplitude_scale))
+            bounds.append((None, None))
 
         # Amplitude slope bounds
         for i in range(num_spaxels):
             bounds.append((None, None))
 
         # Offset bounds
-        for i in range(num_spaxels):
-            bounds.append((-1. / offset_scale, 1. / offset_scale))
+        # for i in range(num_spaxels):
+            # bounds.append((-1. / offset_scale, 1. / offset_scale))
 
         # Core width bounds
-        for i in range(num_spaxels):
-            bounds.append((0.5, 3.))
+        if fix_core_widths is None:
+            for i in range(num_spaxels):
+                bounds.append((0.5, 3.))
 
         # Tail bounds
-        bounds.append((0., 1.))
-        bounds.append((0.2, 10))
-        bounds.append((0.5, 10))
+        # bounds.append((0.01 / tail_fraction_scale, 0.3 / tail_fraction_scale))
+        # bounds.append((1.01, 10.))
+        # bounds.append((0.01 / tail_fraction_scale, 0.3 / tail_fraction_scale))
+        # bounds.append((1.01, 10.))
 
         # Background bound
         bounds.append((None, None))
+        # bounds.append((0. / background_scale, 1. / background_scale))
 
         res = minimize(
             fit_func,
             start_params,
             method='L-BFGS-B',
             bounds=bounds,
-            options={'maxfun': 100000}
+            options={'maxfun': 20000}
         )
 
         if not res.success:
-            # raise OpticalModelFitException(res.message)
-            print(OpticalModelFitException(res.message))
+            from IPython import embed; embed()
+            raise OpticalModelFitException(res.message)
+            # print(OpticalModelFitException(res.message))
 
         fit_params = res.x
-        amplitudes, amplitude_slopes, offsets, core_widths, tail_fraction, \
-            tail_alpha, tail_beta, background = parse_parameters(fit_params)
+        amplitudes, amplitude_slopes, offsets, core_widths, \
+            tail_fraction_left, tail_index_left, tail_fraction_right, \
+            tail_index_right, background = parse_parameters(fit_params)
 
         result_model = patch_model(*parse_parameters(fit_params))
 
-        from IPython import embed; embed()
-
-
-        do_print = verbose_level >= 2
-
-        if (verbose_level == 1 and
-                (fit_amp < 0.2*start_amp or fit_amp > 2.0*start_amp)):
-            print("WARNING: Fit amplitude out of normal bounds:")
-            do_print = True
-
-        if do_print:
-            print("Fit results:")
-            print("    Amplitude:  %8.2f (start: %8.2f)" %
-                  (fit_amp, start_amp))
-            print("    Center:     %8.2f (start: %8.2f)" % (fit_mu, 0.))
-            print("    Sigma:      %8.2f (start: %8.2f)" % (fit_sigma, 1.))
-            if fit_background:
-                print("    Background: %8.2f (start: %8.2f)" %
-                      (background, 0.))
-
         result = {
-            'amplitude': fit_amp,
-            'amplitude_slope': fit_amp_slope,
-            'offset': fit_mu,
-            'width': fit_sigma,
+            'amplitudes': amplitudes,
+            'amplitude_slopes': amplitude_slopes,
+            'offsets': offsets,
+            'core_widths': core_widths,
 
-            'patch': patch,
+            'tail_fraction_left': tail_fraction_left,
+            'tail_index_left': tail_index_left,
+            'tail_fraction_right': tail_fraction_right,
+            'tail_index_right': tail_index_right,
+
+            'background': background,
+
+            'spaxel_numbers': spaxel_numbers,
+            'spaxel_full_wavelengths': spaxel_waves,
+            'spaxel_wavelengths': np.median(spaxel_waves, axis=1),
+            'spaxel_dxs': spaxel_dxs,
+
             'model': result_model,
-            'fit_x': fit_x,
-            'fit_y': fit_y,
+            'patch': patch,
+
+            'ccd_x': ccd_x,
+            'ccd_y': ccd_y,
+
             'fit_result': res,
-
-            'spaxel_number': spaxel_number,
-            'wavelength': wavelength,
-
-            'ccd_x': center_x,
-            'ccd_y': center_y,
         }
-
-        if fit_background:
-            result['background'] = background
 
         return result
 

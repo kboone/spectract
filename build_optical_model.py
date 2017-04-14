@@ -32,7 +32,7 @@ paths = [
     # ('./data/P13_129_092_010_07_B.fits', './data/P13_129_092_011_03_B.fits'),
 
     # Real data test. This image has the U patch in es2
-    # ('./data/P08_231_069_003_17_B.fits', './data/P08_231_069_004_03_B.fits'),
+    ('./data/P08_231_069_003_17_B.fits', './data/P08_231_069_004_03_B.fits'),
 
     # Don't use:
     # Bad fits file??
@@ -42,8 +42,8 @@ paths = [
 ref_idx = 2
 
 print("TODO: go back to more wavelengths")
-# psf_ref_waves = [4100., 4400., 4700.]
-psf_ref_waves = [4700.]
+psf_ref_waves = [4100., 4400., 4700.]
+# psf_ref_waves = [4700.]
 
 ###############################################################################
 # CONFIG
@@ -360,7 +360,7 @@ def build_core_psf(cont_image, wavelengths):
         tck = (t, pad_c, k)
         int_tck = splantider(tck)
 
-        def interp_func(x, amp, mu, sigma, func_limit=1e10):
+        def interp_func(x, amp, mu, sigma, func_limit=1e10, norm=True):
             x_max = (x + 0.5 - mu)
             x_min = (x - 0.5 - mu)
             x_max[x_max > func_limit] = func_limit
@@ -370,14 +370,23 @@ def build_core_psf(cont_image, wavelengths):
 
             right_eval = splev(x_max/sigma, int_tck, ext=3)
             left_eval = splev(x_min/sigma, int_tck, ext=3)
-            return amp * (right_eval - left_eval)
+
+            result = amp * (right_eval - left_eval)
+
+            if norm:
+                right_lim = splev(func_limit/sigma, int_tck, ext=3)
+                left_lim = splev(-func_limit/sigma, int_tck, ext=3)
+                norm = right_lim - left_lim
+                result /= norm
+
+            return result
 
         return interp_func
 
     def to_min(c):
         interp_func = gen_interp_func(c)
-        return np.sum((interp_func(psf_fit_x, 1., 0., psf_fit_widths) -
-                       psf_fit_y)**2)
+        model = interp_func(psf_fit_x, 1., 0., psf_fit_widths, norm=False)
+        return np.sum((psf_fit_y - model)**2)
 
     res = minimize(to_min, start_c)
 
@@ -513,8 +522,52 @@ def cauchy_full_psf(x, amplitude, center, core_psf, core_width, tail_fraction,
     return full_psf_vals
 
 
+def power_law_full_psf(x, amplitude, center, core_psf, core_width,
+                       tail_fraction_left, tail_index_left,
+                       tail_fraction_right, tail_index_right, core_range=2.0):
+
+    core_psf_vals = core_psf(x, amplitude, center, core_width, core_range)
+
+    tail_psf_x = x - center
+    tail_psf_x_max = tail_psf_x + 0.5
+    tail_psf_x_min = tail_psf_x - 0.5
+
+    sign = (tail_psf_x > 0) * 2 - 1
+    cut_max = np.abs(tail_psf_x_max) < core_range
+    tail_psf_x_max[cut_max] = core_range * sign[cut_max]
+    cut_min = np.abs(tail_psf_x_min) < core_range
+    tail_psf_x_min[cut_min] = core_range * sign[cut_min]
+
+    tail_right_cut = tail_psf_x > 0
+
+    tail_psf_vals = np.zeros(x.shape)
+    right_max_vals = -((tail_psf_x_max[tail_right_cut] / core_range) **
+                       (1 - tail_index_right))
+    right_min_vals = -((tail_psf_x_min[tail_right_cut] / core_range) **
+                       (1 - tail_index_right))
+    right_vals = (amplitude[tail_right_cut] * tail_fraction_right *
+                  (right_max_vals - right_min_vals))
+
+    # Note: do a sign flip here. We want absolute values of x in the power law.
+    left_max_vals = -((-tail_psf_x_max[~tail_right_cut] / core_range) **
+                      (1 - tail_index_left))
+    left_min_vals = -((-tail_psf_x_min[~tail_right_cut] / core_range) **
+                      (1 - tail_index_left))
+    left_vals = -(amplitude[~tail_right_cut] * tail_fraction_left *
+                  (left_max_vals - left_min_vals))
+
+    tail_psf_vals[tail_right_cut] = right_vals
+    tail_psf_vals[~tail_right_cut] = left_vals
+
+    norm = 1. + tail_fraction_left + tail_fraction_right
+
+    full_psf_vals = (core_psf_vals + tail_psf_vals) / norm
+
+    return full_psf_vals
+
+
 def full_psf(x, amplitude, center, core_psf, core_width, tail_psf,
-             tail_fraction, core_range=3):
+             tail_fraction, core_range=3.):
     core_psf_vals = core_psf(x, amplitude, center, core_width, core_range)
     tail_psf_vals = tail_psf(x, amplitude*tail_fraction, center, core_range)
 
@@ -561,22 +614,48 @@ if __name__ == "__main__":
 
 
     print("Test patch fit")
-    coords_x, coords_y = cont_images[0].get_all_ccd_coordinates(4500.)
-    idx = 120
-    # cont_images[0].fit_smooth_patch_2d(885, 1550, full_psf, core_psf_func,
-                                       # build_tail_psf)
-    # cont_images[0].fit_smooth_patch_2d(
-        # coords_x[idx],
-        # coords_y[idx],
-        # full_psf,
+    coords_x, coords_y = cont_images[3].get_all_ccd_coordinates(4500.)
+    idx = 180
+    spaxel_numbers = optical_model.spaxel_numbers
+
+    cont_fits = []
+    data_fits = []
+
+    # for spaxel_number in spaxel_numbers[::10]:
+    for i in range(len(spaxel_numbers)):
+        spaxel_number = spaxel_numbers[i]
+        print(spaxel_number)
+        print("Cont")
+        cont_fit = cont_images[3].fit_smooth_patch_2d(
+            coords_x[i],
+            coords_y[i],
+            power_law_full_psf,
+            core_psf_func,
+            # build_tail_psf,
+            width_x=50.
+        )
+        cont_fits.append(cont_fit)
+
+        print("Data")
+        data_fit = cont_images[-1].fit_smooth_patch_2d(
+            coords_x[i],
+            coords_y[i],
+            power_law_full_psf,
+            core_psf_func,
+            # build_tail_psf,
+            width_x=50.,
+            fix_core_widths=cont_fit['core_widths']
+        )
+        data_fits.append(data_fit)
+
+        # break
+
+
+    # cont_images[2].fit_smooth_patch_2d(
+        # 500.,
+        # 2000.,
+        # power_law_full_psf,
         # core_psf_func,
-        # build_tail_psf
+        # # build_tail_psf,
+        # width_x=200.
     # )
-    cont_images[0].fit_smooth_patch_2d(
-        1000.,
-        1550.,
-        full_psf,
-        core_psf_func,
-        build_tail_psf,
-        width_x=50.
-    )
